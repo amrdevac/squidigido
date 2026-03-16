@@ -1,4 +1,4 @@
-import { client } from "./client";
+import { getClient } from "./client";
 
 type WhereClause<T> = Partial<Record<keyof T, any>>;
 type RelationType = "hasOne" | "hasMany";
@@ -58,6 +58,7 @@ class TursoQuery<T extends Record<string, any>> {
 
 
   async get(): Promise<T[]> {
+    const client = getClient();
     let sql = `SELECT * FROM ${this.table}`;
     const args: any[] = [];
 
@@ -122,6 +123,7 @@ class TursoQuery<T extends Record<string, any>> {
   }
 
   async save(): Promise<{ success: true }> {
+    const client = getClient();
     const cols = Object.keys(this.data);
     const placeholders = cols.map(() => "?").join(", ");
     const sql = `INSERT INTO ${this.table} (${cols.join(
@@ -133,6 +135,7 @@ class TursoQuery<T extends Record<string, any>> {
   }
 
   async update(data: Partial<T>): Promise<{ success: true }> {
+    const client = getClient();
     if (Object.keys(this.whereClause).length === 0) {
       throw new Error("Update needs a where clause!");
     }
@@ -152,6 +155,7 @@ class TursoQuery<T extends Record<string, any>> {
   }
 
   async delete(): Promise<{ success: true }> {
+    const client = getClient();
     if (Object.keys(this.whereClause).length === 0) {
       throw new Error("Delete needs a where clause!");
     }
