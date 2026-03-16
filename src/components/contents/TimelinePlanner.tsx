@@ -22,10 +22,12 @@ import { cn } from "@/lib/utils";
 
 type DurationUnit = "day" | "week" | "month";
 type TimelineViewMode = "day" | "week";
+type ColumnVerticalAlign = "top" | "middle" | "bottom";
 
 type RawCell = {
   value: string;
   mergeDown: boolean;
+  mergeAuto: boolean;
   items: string[];
 };
 
@@ -70,6 +72,7 @@ type TimelinePlannerSnapshot = {
   tableCellPaddingX?: string;
   tableCellPaddingY?: string;
   hiddenColumnIndexes?: number[];
+  columnAlignments?: Record<string, ColumnVerticalAlign>;
   showNumber: boolean;
   rawInput: string;
 };
@@ -272,10 +275,10 @@ function parseRawLine(line: string, index: number): ParsedGroup | null {
       .replace(/;manual=[\d,]+/gi, "")
       .replace(/;tstatus=[a-zA-Z _-]+/gi, "")
       .trim();
-    const mergeDown = withoutMacros.endsWith(";m");
-    const normalizedSource = mergeDown
-      ? withoutMacros.slice(0, withoutMacros.length - 2).trim()
-      : withoutMacros;
+    const mergeAuto = /;ma\b/i.test(withoutMacros);
+    const withoutAutoMerge = withoutMacros.replace(/;ma\b/gi, "").trim();
+    const mergeDown = /;m\b/i.test(withoutAutoMerge);
+    const normalizedSource = withoutAutoMerge.replace(/;m\b/gi, "").trim();
     const normalizedValue = normalizedSource;
     const items = normalizedValue
       .split(",")
@@ -285,6 +288,7 @@ function parseRawLine(line: string, index: number): ParsedGroup | null {
     return {
       value: normalizedValue,
       mergeDown,
+      mergeAuto,
       items: items.length > 0 ? items : [normalizedValue],
     };
   });
@@ -342,6 +346,60 @@ function parseRawTable(input: string): ParsedTable {
     groups,
     timelineHeader,
   };
+}
+
+function normalizeRawInputStructure(input: string) {
+  const lines = input
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length <= 1) {
+    return input;
+  }
+
+  const headerParts = lines[0].split("|").map((part) => part.trim());
+  const headerCount = headerParts.length;
+  const activeAutoMergeColumns = new Set<number>();
+  const normalizedLines = [headerParts.join(" | ")];
+
+  lines.slice(1).forEach((line) => {
+    const parts = line.split("|").map((part) => part.trim());
+
+    if (parts.length < headerCount && activeAutoMergeColumns.size > 0) {
+      Array.from(activeAutoMergeColumns)
+        .sort((left, right) => left - right)
+        .forEach((columnIndex) => {
+          if (parts.length < headerCount) {
+            parts.splice(Math.min(columnIndex, parts.length), 0, "");
+          }
+        });
+    }
+
+    while (parts.length < headerCount) {
+      parts.push("");
+    }
+
+    Array.from(activeAutoMergeColumns).forEach((columnIndex) => {
+      if ((parts[columnIndex] || "").trim() !== "") {
+        activeAutoMergeColumns.delete(columnIndex);
+      }
+    });
+
+    for (let columnIndex = 0; columnIndex < headerCount; columnIndex += 1) {
+      const part = parts[columnIndex] || "";
+      const hasAutoMerge = /;ma\b/i.test(part);
+      const cleanedPart = part.replace(/;ma\b/gi, "").trim();
+
+      if (hasAutoMerge && cleanedPart !== "") {
+        activeAutoMergeColumns.add(columnIndex);
+      }
+    }
+
+    normalizedLines.push(parts.slice(0, headerCount).join(" | "));
+  });
+
+  return normalizedLines.join("\n");
 }
 
 function statusTone(value: string) {
@@ -524,6 +582,44 @@ function getTimelineAssignments(
   return assignments;
 }
 
+function buildAutoMergeMap(groups: ParsedGroup[], columnCount: number) {
+  const rowSpanMap = new Map<string, number>();
+  const coveredMap = new Set<string>();
+
+  for (let columnIndex = 0; columnIndex < columnCount; columnIndex += 1) {
+    let activeStartKey: string | null = null;
+    let activeSpan = 0;
+
+    groups.forEach((group) => {
+      const cell = group.cells[columnIndex];
+      const hasValue = Boolean(cell?.value.trim());
+
+      if (activeStartKey) {
+        if (hasValue) {
+          rowSpanMap.set(activeStartKey, activeSpan);
+          activeStartKey = null;
+          activeSpan = 0;
+        } else {
+          coveredMap.add(`${group.id}:${columnIndex}`);
+          activeSpan += group.rowCount;
+          return;
+        }
+      }
+
+      if (cell?.mergeAuto && hasValue) {
+        activeStartKey = `${group.id}:${columnIndex}`;
+        activeSpan = group.rowCount;
+      }
+    });
+
+    if (activeStartKey) {
+      rowSpanMap.set(activeStartKey, activeSpan);
+    }
+  }
+
+  return { rowSpanMap, coveredMap };
+}
+
 function updateRawInputStartMacro(
   source: string,
   groupId: string,
@@ -677,6 +773,7 @@ export default function TimelinePlanner() {
   const [openGroupActionId, setOpenGroupActionId] = useState<string | null>(null);
   const [openHiddenColumnsMenu, setOpenHiddenColumnsMenu] = useState(false);
   const [hiddenColumnIndexes, setHiddenColumnIndexes] = useState<number[]>([]);
+  const [columnAlignments, setColumnAlignments] = useState<Record<string, ColumnVerticalAlign>>({});
   const [editingHeader, setEditingHeader] = useState<EditingHeaderState | null>(null);
   const [editingHeaderDraft, setEditingHeaderDraft] = useState("");
   const [isParserDialogOpen, setIsParserDialogOpen] = useState(false);
@@ -715,6 +812,10 @@ export default function TimelinePlanner() {
     () => Math.max(parsedTable.headers.length || 0, ...parsedGroups.map((group) => group.cells.length), 0),
     [parsedGroups, parsedTable.headers.length]
   );
+  const autoMergeMap = useMemo(
+    () => buildAutoMergeMap(parsedGroups, maxColumnCount),
+    [parsedGroups, maxColumnCount]
+  );
   const visibleColumnIndexes = useMemo(
     () =>
       Array.from({ length: maxColumnCount }, (_, index) => index).filter(
@@ -745,8 +846,10 @@ export default function TimelinePlanner() {
   }
 
   function handleSubmitRawInput() {
+    const normalizedRawInput = normalizeRawInputStructure(rawInput);
+    setRawInput(normalizedRawInput);
     startTransition(() => {
-      setSubmittedInput(rawInput);
+      setSubmittedInput(normalizedRawInput);
     });
   }
 
@@ -762,6 +865,7 @@ export default function TimelinePlanner() {
       tableCellPaddingX,
       tableCellPaddingY,
       hiddenColumnIndexes,
+      columnAlignments,
       showNumber,
       rawInput,
     };
@@ -777,10 +881,12 @@ export default function TimelinePlanner() {
     setTableCellPaddingX(snapshot.tableCellPaddingX ?? "12");
     setTableCellPaddingY(snapshot.tableCellPaddingY ?? "8");
     setHiddenColumnIndexes(snapshot.hiddenColumnIndexes ?? []);
+    setColumnAlignments(snapshot.columnAlignments ?? {});
     setShowNumber(snapshot.showNumber);
-    setRawInput(snapshot.rawInput);
+    const normalizedRawInput = normalizeRawInputStructure(snapshot.rawInput);
+    setRawInput(normalizedRawInput);
     startTransition(() => {
-      setSubmittedInput(snapshot.rawInput);
+      setSubmittedInput(normalizedRawInput);
     });
   }
 
@@ -813,6 +919,8 @@ export default function TimelinePlanner() {
         (parsed.tableCellPaddingY !== undefined && typeof parsed.tableCellPaddingY !== "string") ||
         (parsed.hiddenColumnIndexes !== undefined &&
           !Array.isArray(parsed.hiddenColumnIndexes)) ||
+        (parsed.columnAlignments !== undefined &&
+          (typeof parsed.columnAlignments !== "object" || parsed.columnAlignments === null)) ||
         typeof parsed.showNumber !== "boolean" ||
         typeof parsed.rawInput !== "string"
       ) {
@@ -831,6 +939,7 @@ export default function TimelinePlanner() {
         tableCellPaddingX: parsed.tableCellPaddingX,
         tableCellPaddingY: parsed.tableCellPaddingY,
         hiddenColumnIndexes: parsed.hiddenColumnIndexes?.filter((value) => Number.isInteger(value)),
+        columnAlignments: parsed.columnAlignments as Record<string, ColumnVerticalAlign> | undefined,
         showNumber: parsed.showNumber,
         rawInput: parsed.rawInput,
       });
@@ -1060,6 +1169,14 @@ export default function TimelinePlanner() {
     setOpenHeaderActionIndex(null);
   }
 
+  function handleSetColumnAlignment(columnIndex: number, alignment: ColumnVerticalAlign) {
+    setColumnAlignments((current) => ({
+      ...current,
+      [String(columnIndex)]: alignment,
+    }));
+    setOpenHeaderActionIndex(null);
+  }
+
   function handleTimelineStatusChange(groupId: string, timelineStatus: string) {
     setRawInput((currentRawInput) => {
       const nextRawInput = updateRawInputTimelineStatusMacro(
@@ -1129,134 +1246,280 @@ export default function TimelinePlanner() {
             </Button>
           </div>
         </div>
-        <div className="flex flex-col gap-3 rounded-2xl border border-white/10 bg-slate-950/70 p-3 md:flex-row md:items-center md:justify-between">
-          <div>
-            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">
-              Table Toolbar
+        <div className="rounded-2xl border border-white/10 bg-slate-950/70 p-4 shadow-[0_18px_40px_rgba(2,6,23,0.18)]">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div className="max-w-md">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-300">
+                Table Toolbar
+              </div>
+              <div className="mt-1 text-sm font-medium text-white">
+                Kontrol tampilan tabel
+              </div>
+              <div className="mt-1 text-xs leading-5 text-slate-400">
+                Atur kolom tersembunyi, nomor baris, ukuran font, dan padding value dari satu area yang rapi.
+              </div>
             </div>
-            <div className="text-xs text-slate-400">
-              Font size, padding, dan hidden column diatur dari sini.
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-3">
-            <div className="relative">
-              <button
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  setOpenHiddenColumnsMenu((current) => !current);
-                }}
-                className="flex h-9 items-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white transition hover:bg-slate-800"
-              >
-                Hidden col
-              </button>
-              {openHiddenColumnsMenu ? (
-                <div
-                  className="absolute top-11 left-0 z-30 grid min-w-48 overflow-hidden rounded-lg border border-white/10 bg-slate-950 shadow-2xl"
-                  onClick={(event) => event.stopPropagation()}
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setOpenHiddenColumnsMenu((current) => !current);
+                  }}
+                  className="flex h-10 items-center rounded-xl border border-slate-700 bg-slate-900 px-4 text-sm font-medium text-white transition hover:border-slate-500 hover:bg-slate-800"
                 >
-                  {Array.from({ length: maxColumnCount }, (_, index) => {
-                    const isHidden = hiddenColumnIndexes.includes(index);
-                    const label = parsedTable.headers[index] || `Kolom ${index + 1}`;
-                    return (
-                      <button
-                        key={`hidden-col-${index}`}
-                        type="button"
-                        onClick={() => handleToggleHiddenColumn(index)}
-                        className="flex items-center justify-between gap-3 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900"
-                      >
-                        <span>{label}</span>
-                        <span className={cn(isHidden ? "text-amber-300" : "text-emerald-300")}>
-                          {isHidden ? "Hidden" : "Shown"}
-                        </span>
-                      </button>
-                    );
-                  })}
+                  Hidden col
+                  {hiddenColumnIndexes.length > 0 ? (
+                    <span className="ml-2 rounded-full bg-slate-800 px-2 py-0.5 text-[11px] text-slate-300">
+                      {hiddenColumnIndexes.length}
+                    </span>
+                  ) : null}
+                </button>
+                {openHiddenColumnsMenu ? (
+                  <div
+                    className="absolute top-12 left-0 z-30 grid min-w-56 overflow-hidden rounded-xl border border-white/10 bg-slate-950 shadow-2xl"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    {Array.from({ length: maxColumnCount }, (_, index) => {
+                      const isHidden = hiddenColumnIndexes.includes(index);
+                      const label = parsedTable.headers[index] || `Kolom ${index + 1}`;
+                      return (
+                        <button
+                          key={`hidden-col-${index}`}
+                          type="button"
+                          onClick={() => handleToggleHiddenColumn(index)}
+                          className="flex items-center justify-between gap-3 px-4 py-2.5 text-left text-xs text-slate-200 transition hover:bg-slate-900"
+                        >
+                          <span>{label}</span>
+                          <span className={cn(isHidden ? "text-amber-300" : "text-emerald-300")}>
+                            {isHidden ? "Hidden" : "Shown"}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </div>
+              <label className="flex h-10 items-center gap-3 rounded-xl border border-slate-700 bg-slate-900 px-4 text-sm text-slate-200">
+                <input
+                  type="checkbox"
+                  checked={showNumber}
+                  onChange={(event) => setShowNumber(event.target.checked)}
+                  className="size-4 rounded border-slate-500 bg-slate-950"
+                />
+                <span>Show number</span>
+              </label>
+              <label className="grid gap-1.5 text-xs text-slate-300">
+                <span className="px-1 uppercase tracking-[0.14em] text-slate-500">Font Size</span>
+                <div className="flex h-10 items-center rounded-xl border border-slate-700 bg-slate-900 pr-3 shadow-inner shadow-black/10">
+                  <input
+                    inputMode="numeric"
+                    value={tableFontSize}
+                    onChange={(event) => setTableFontSize(event.target.value.replace(/\D/g, "").slice(0, 2))}
+                    className="h-full w-20 bg-transparent px-4 text-sm font-medium text-white outline-none"
+                  />
+                  <span className="text-xs text-slate-400">px</span>
                 </div>
-              ) : null}
+              </label>
+              <label className="grid gap-1.5 text-xs text-slate-300">
+                <span className="px-1 uppercase tracking-[0.14em] text-slate-500">Padding X</span>
+                <div className="flex h-10 items-center rounded-xl border border-slate-700 bg-slate-900 pr-3 shadow-inner shadow-black/10">
+                  <input
+                    inputMode="numeric"
+                    value={tableCellPaddingX}
+                    onChange={(event) =>
+                      setTableCellPaddingX(event.target.value.replace(/\D/g, "").slice(0, 2))
+                    }
+                    className="h-full w-20 bg-transparent px-4 text-sm font-medium text-white outline-none"
+                  />
+                  <span className="text-xs text-slate-400">px</span>
+                </div>
+              </label>
+              <label className="grid gap-1.5 text-xs text-slate-300">
+                <span className="px-1 uppercase tracking-[0.14em] text-slate-500">Padding Y</span>
+                <div className="flex h-10 items-center rounded-xl border border-slate-700 bg-slate-900 pr-3 shadow-inner shadow-black/10">
+                  <input
+                    inputMode="numeric"
+                    value={tableCellPaddingY}
+                    onChange={(event) =>
+                      setTableCellPaddingY(event.target.value.replace(/\D/g, "").slice(0, 2))
+                    }
+                    className="h-full w-20 bg-transparent px-4 text-sm font-medium text-white outline-none"
+                  />
+                  <span className="text-xs text-slate-400">px</span>
+                </div>
+              </label>
             </div>
-            <label className="flex items-center gap-3 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200">
-              <input
-                type="checkbox"
-                checked={showNumber}
-                onChange={(event) => setShowNumber(event.target.checked)}
-                className="size-4 rounded border-slate-500 bg-slate-950"
-              />
-              <span>Show number</span>
-            </label>
-            <label className="grid gap-1 text-xs text-slate-300">
-              <span>Font size</span>
-              <div className="flex items-center rounded-md border border-slate-700 bg-slate-900 pr-3">
-                <input
-                  inputMode="numeric"
-                  value={tableFontSize}
-                  onChange={(event) => setTableFontSize(event.target.value.replace(/\D/g, "").slice(0, 2))}
-                  className="h-9 w-20 bg-transparent px-3 text-sm text-white outline-none"
-                />
-                <span className="text-xs text-slate-400">px</span>
-              </div>
-            </label>
-            <label className="grid gap-1 text-xs text-slate-300">
-              <span>Padding X</span>
-              <div className="flex items-center rounded-md border border-slate-700 bg-slate-900 pr-3">
-                <input
-                  inputMode="numeric"
-                  value={tableCellPaddingX}
-                  onChange={(event) =>
-                    setTableCellPaddingX(event.target.value.replace(/\D/g, "").slice(0, 2))
-                  }
-                  className="h-9 w-20 bg-transparent px-3 text-sm text-white outline-none"
-                />
-                <span className="text-xs text-slate-400">px</span>
-              </div>
-            </label>
-            <label className="grid gap-1 text-xs text-slate-300">
-              <span>Padding Y</span>
-              <div className="flex items-center rounded-md border border-slate-700 bg-slate-900 pr-3">
-                <input
-                  inputMode="numeric"
-                  value={tableCellPaddingY}
-                  onChange={(event) =>
-                    setTableCellPaddingY(event.target.value.replace(/\D/g, "").slice(0, 2))
-                  }
-                  className="h-9 w-20 bg-transparent px-3 text-sm text-white outline-none"
-                />
-                <span className="text-xs text-slate-400">px</span>
-              </div>
-            </label>
           </div>
-        </div>
-        <section className="grid gap-6 overflow-auto">
-          <Card className="border-white/10 bg-slate-950/60 shadow-[0_20px_70px_rgba(2,6,23,0.4)] backdrop-blur">
-            <CardContent className="flex flex-col gap-5">
-              <div className="flex flex-wrap gap-2 text-xs text-slate-400">
-                <span className="rounded-full border border-white/10 bg-slate-900 px-3 py-1">
-                  {parsedGroups.length} grup
-                </span>
-                <span className="rounded-full border border-white/10 bg-slate-900 px-3 py-1">
-                  {maxColumnCount} kolom
-                </span>
-                <span className="rounded-full border border-white/10 bg-slate-900 px-3 py-1">
-                  {timelineDates.length} hari
-                </span>
-              </div>
+          <section className="grid gap-6 overflow-auto">
+            <Card className="border-white/10 bg-slate-950/60 shadow-[0_20px_70px_rgba(2,6,23,0.4)] backdrop-blur">
+              <CardContent className="flex flex-col gap-5">
+                <div className="flex flex-wrap gap-2 text-xs text-slate-400">
+                  <span className="rounded-full border border-white/10 bg-slate-900 px-3 py-1">
+                    {parsedGroups.length} grup
+                  </span>
+                  <span className="rounded-full border border-white/10 bg-slate-900 px-3 py-1">
+                    {maxColumnCount} kolom
+                  </span>
+                  <span className="rounded-full border border-white/10 bg-slate-900 px-3 py-1">
+                    {timelineDates.length} hari
+                  </span>
+                </div>
 
 
 
-              <div className="overflow-x-auto">
-                <div className="inline-block w-max rounded-2xl border border-white/10 bg-slate-950/70 p-3 align-top">
-                  {(() => {
-                    const weekBuckets = createWeekBuckets(timelineDates);
-                    const monthBuckets = createMonthBuckets(timelineDates);
-                    return (
-                      <table className="w-max border-separate border-spacing-0 bg-slate-950" style={{ fontSize: `${fontSizePx}px` }}>
-                        <thead>
-                          {timelineViewMode === "day" ? (
-                            <>
+                <div className="overflow-x-auto">
+                  <div className="inline-block w-max rounded-2xl border border-white/10 bg-slate-950/70 p-3 align-top">
+                    {(() => {
+                      const weekBuckets = createWeekBuckets(timelineDates);
+                      const monthBuckets = createMonthBuckets(timelineDates);
+                      return (
+                        <table className="w-max border-separate border-spacing-0 bg-slate-950" style={{ fontSize: `${fontSizePx}px` }}>
+                          <thead>
+                            {timelineViewMode === "day" ? (
+                              <>
+                                <tr className="text-slate-200">
+                                  {showNumber ? (
+                                    <th
+                                      rowSpan={2}
+                                      className={cn(
+                                        "w-16 bg-slate-900 border-b border-r border-white/10 px-4 py-2 text-center align-middle font-semibold"
+                                      )}
+                                      style={{ fontSize: `${fontSizePx}px` }}
+                                    >
+                                      No
+                                    </th>
+                                  ) : null}
+                                  <th
+                                    rowSpan={2}
+                                    className="w-20 bg-slate-900 border-b border-r border-white/10 px-3 py-2 text-center align-middle font-semibold"
+                                    style={{ fontSize: `${fontSizePx}px` }}
+                                  >
+                                    Action
+                                  </th>
+                                  {visibleColumnIndexes.map((index) => (
+                                    <th
+                                      key={`header-${index}`}
+                                      rowSpan={2}
+                                      className={cn(
+                                        "bg-slate-900 border-b border-r border-white/10 px-4 py-2 text-left font-semibold last:border-r-0"
+                                      )}
+                                      style={{ fontSize: `${fontSizePx}px` }}
+                                    >
+                                      <div className="flex items-center justify-between gap-2">
+                                        <span>{parsedTable.headers[index] || `Kolom ${index + 1}`}</span>
+                                        {index < parsedTable.headers.length ? (
+                                          <div className="relative">
+                                            <button
+                                              type="button"
+                                              onClick={(event) => {
+                                                event.stopPropagation();
+                                                setOpenHeaderActionIndex((current) =>
+                                                  current === index ? null : index
+                                                );
+                                              }}
+                                              className="flex size-7 items-center justify-center rounded-md border border-white/10 bg-slate-950/80 text-slate-300 transition hover:bg-slate-800"
+                                              aria-label={`Aksi kolom ${parsedTable.headers[index]}`}
+                                            >
+                                              <MoreVertical className="size-4" />
+                                            </button>
+                                          {openHeaderActionIndex === index ? (
+                                            <div
+                                              className="absolute top-9 right-0 z-20 min-w-32 rounded-lg border border-white/10 bg-slate-950 shadow-2xl"
+                                              onClick={(event) => event.stopPropagation()}
+                                            >
+                                                <div className="group/align relative">
+                                                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900">
+                                                    <span>Align</span>
+                                                    <span className="text-slate-500">›</span>
+                                                  </div>
+                                                  <div className="invisible absolute top-0 left-full z-30 ml-1 grid min-w-32 overflow-hidden rounded-lg border border-white/10 bg-slate-950 opacity-0 shadow-2xl transition group-hover/align:visible group-hover/align:opacity-100">
+                                                    {(["top", "middle", "bottom"] as ColumnVerticalAlign[]).map((alignment) => {
+                                                      const isActive = (columnAlignments[String(index)] ?? "top") === alignment;
+                                                      return (
+                                                        <button
+                                                          key={alignment}
+                                                          type="button"
+                                                          onClick={() => handleSetColumnAlignment(index, alignment)}
+                                                          className="flex items-center justify-between gap-3 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900"
+                                                        >
+                                                          <span>
+                                                            {alignment === "top"
+                                                              ? "Top"
+                                                              : alignment === "middle"
+                                                                ? "Middle"
+                                                                : "Bottom"}
+                                                          </span>
+                                                          <span className={cn(isActive ? "text-emerald-300" : "text-transparent")}>✓</span>
+                                                        </button>
+                                                      );
+                                                    })}
+                                                  </div>
+                                                </div>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => handleToggleHiddenColumn(index)}
+                                                  className="flex items-center gap-2 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900"
+                                                >
+                                                  <MoreHorizontal className="size-4" />
+                                                  Hide
+                                                </button>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => handleOpenHeaderEdit(index)}
+                                                  className="flex items-center gap-2 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900"
+                                                >
+                                                  <Pencil className="size-4" />
+                                                  Edit
+                                                </button>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => handleDeleteColumn(index)}
+                                                  className="flex items-center gap-2 px-3 py-2 text-left text-xs text-rose-300 transition hover:bg-rose-500/10"
+                                                >
+                                                  <Trash2 className="size-4" />
+                                                  Hapus
+                                                </button>
+                                              </div>
+                                            ) : null}
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                    </th>
+                                  ))}
+                                  {monthBuckets.map((bucket) => (
+                                    <th
+                                      key={bucket.label}
+                                      colSpan={bucket.dates.length}
+                                      className={cn(
+                                        "bg-slate-900 border-b border-r border-white/10 px-2 py-2 text-center font-semibold uppercase tracking-[0.18em] text-slate-300 last:border-r-0"
+                                      )}
+                                      style={{ fontSize: `${monthFontSizePx}px` }}
+                                    >
+                                      {bucket.label}
+                                    </th>
+                                  ))}
+                                </tr>
+                                <tr className="text-slate-200">
+                                  {timelineDates.map((date) => (
+                                    <th
+                                      key={date}
+                                      title={`${formatWeekday(date)}, ${formatLongDate(date)}`}
+                                      className={cn(
+                                        "bg-slate-900/95 border-b border-r border-white/10 text-center font-semibold last:border-r-0"
+                                      )}
+                                      style={{ ...timelineCellStyle, fontSize: `${dayFontSizePx}px` }}
+                                    >
+                                      {formatDayNumber(date)}
+                                    </th>
+                                  ))}
+                                </tr>
+                              </>
+                            ) : (
                               <tr className="text-slate-200">
                                 {showNumber ? (
                                   <th
-                                    rowSpan={2}
                                     className={cn(
                                       "w-16 bg-slate-900 border-b border-r border-white/10 px-4 py-2 text-center align-middle font-semibold"
                                     )}
@@ -1266,7 +1529,6 @@ export default function TimelinePlanner() {
                                   </th>
                                 ) : null}
                                 <th
-                                  rowSpan={2}
                                   className="w-20 bg-slate-900 border-b border-r border-white/10 px-3 py-2 text-center align-middle font-semibold"
                                   style={{ fontSize: `${fontSizePx}px` }}
                                 >
@@ -1275,7 +1537,6 @@ export default function TimelinePlanner() {
                                 {visibleColumnIndexes.map((index) => (
                                   <th
                                     key={`header-${index}`}
-                                    rowSpan={2}
                                     className={cn(
                                       "bg-slate-900 border-b border-r border-white/10 px-4 py-2 text-left font-semibold last:border-r-0"
                                     )}
@@ -1298,11 +1559,39 @@ export default function TimelinePlanner() {
                                           >
                                             <MoreVertical className="size-4" />
                                           </button>
-                                          {openHeaderActionIndex === index ? (
-                                            <div
-                                              className="absolute top-9 right-0 z-20 grid min-w-32 overflow-hidden rounded-lg border border-white/10 bg-slate-950 shadow-2xl"
-                                              onClick={(event) => event.stopPropagation()}
-                                            >
+                                        {openHeaderActionIndex === index ? (
+                                          <div
+                                            className="absolute top-9 right-0 z-20 min-w-32 rounded-lg border border-white/10 bg-slate-950 shadow-2xl"
+                                            onClick={(event) => event.stopPropagation()}
+                                          >
+                                              <div className="group/align relative">
+                                                <div className="flex items-center justify-between gap-3 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900">
+                                                  <span>Align</span>
+                                                  <span className="text-slate-500">›</span>
+                                                </div>
+                                                <div className="invisible absolute top-0 left-full z-30 ml-1 grid min-w-32 overflow-hidden rounded-lg border border-white/10 bg-slate-950 opacity-0 shadow-2xl transition group-hover/align:visible group-hover/align:opacity-100">
+                                                  {(["top", "middle", "bottom"] as ColumnVerticalAlign[]).map((alignment) => {
+                                                    const isActive = (columnAlignments[String(index)] ?? "top") === alignment;
+                                                    return (
+                                                      <button
+                                                        key={alignment}
+                                                        type="button"
+                                                        onClick={() => handleSetColumnAlignment(index, alignment)}
+                                                        className="flex items-center justify-between gap-3 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900"
+                                                      >
+                                                        <span>
+                                                          {alignment === "top"
+                                                            ? "Top"
+                                                            : alignment === "middle"
+                                                              ? "Middle"
+                                                              : "Bottom"}
+                                                        </span>
+                                                        <span className={cn(isActive ? "text-emerald-300" : "text-transparent")}>✓</span>
+                                                      </button>
+                                                    );
+                                                  })}
+                                                </div>
+                                              </div>
                                               <button
                                                 type="button"
                                                 onClick={() => handleToggleHiddenColumn(index)}
@@ -1334,633 +1623,558 @@ export default function TimelinePlanner() {
                                     </div>
                                   </th>
                                 ))}
-                                {monthBuckets.map((bucket) => (
+                                {weekBuckets.map((bucket) => (
                                   <th
                                     key={bucket.label}
-                                    colSpan={bucket.dates.length}
                                     className={cn(
-                                      "bg-slate-900 border-b border-r border-white/10 px-2 py-2 text-center font-semibold uppercase tracking-[0.18em] text-slate-300 last:border-r-0"
+                                      "min-w-24 bg-slate-900 border-b border-r border-white/10 px-2 py-2 text-center font-semibold last:border-r-0"
                                     )}
-                                    style={{ fontSize: `${monthFontSizePx}px` }}
+                                    style={{ fontSize: `${dayFontSizePx}px` }}
                                   >
-                                    {bucket.label}
+                                    <div className="text-slate-200" style={{ fontSize: `${dayFontSizePx}px` }}>{bucket.label}</div>
+                                    <div className="text-slate-400" style={{ fontSize: `${monthFontSizePx}px` }}>
+                                      {bucket.dates[0] ? formatShortDate(bucket.dates[0]) : ""}{" "}
+                                      {bucket.dates.at(-1) ? `- ${formatShortDate(bucket.dates.at(-1) as string)}` : ""}
+                                    </div>
                                   </th>
                                 ))}
                               </tr>
-                              <tr className="text-slate-200">
-                                {timelineDates.map((date) => (
-                                  <th
-                                    key={date}
-                                    title={`${formatWeekday(date)}, ${formatLongDate(date)}`}
-                                    className={cn(
-                                      "bg-slate-900/95 border-b border-r border-white/10 text-center font-semibold last:border-r-0"
-                                    )}
-                                    style={{ ...timelineCellStyle, fontSize: `${dayFontSizePx}px` }}
-                                  >
-                                    {formatDayNumber(date)}
-                                  </th>
-                                ))}
-                              </tr>
-                            </>
-                          ) : (
-                            <tr className="text-slate-200">
-                          {showNumber ? (
-                            <th
-                              className={cn(
-                                "w-16 bg-slate-900 border-b border-r border-white/10 px-4 py-2 text-center align-middle font-semibold"
-                              )}
-                              style={{ fontSize: `${fontSizePx}px` }}
-                            >
-                                  No
-                                </th>
-                              ) : null}
-                              <th
-                                className="w-20 bg-slate-900 border-b border-r border-white/10 px-3 py-2 text-center align-middle font-semibold"
-                                style={{ fontSize: `${fontSizePx}px` }}
-                              >
-                                Action
-                              </th>
-                              {visibleColumnIndexes.map((index) => (
-                                <th
-                                  key={`header-${index}`}
-                                  className={cn(
-                                    "bg-slate-900 border-b border-r border-white/10 px-4 py-2 text-left font-semibold last:border-r-0"
-                                  )}
-                                  style={{ fontSize: `${fontSizePx}px` }}
-                                >
-                                  <div className="flex items-center justify-between gap-2">
-                                    <span>{parsedTable.headers[index] || `Kolom ${index + 1}`}</span>
-                                    {index < parsedTable.headers.length ? (
-                                      <div className="relative">
-                                        <button
-                                          type="button"
-                                          onClick={(event) => {
-                                            event.stopPropagation();
-                                            setOpenHeaderActionIndex((current) =>
-                                              current === index ? null : index
-                                            );
-                                          }}
-                                          className="flex size-7 items-center justify-center rounded-md border border-white/10 bg-slate-950/80 text-slate-300 transition hover:bg-slate-800"
-                                          aria-label={`Aksi kolom ${parsedTable.headers[index]}`}
-                                        >
-                                          <MoreVertical className="size-4" />
-                                        </button>
-                                        {openHeaderActionIndex === index ? (
-                                          <div
-                                            className="absolute top-9 right-0 z-20 grid min-w-32 overflow-hidden rounded-lg border border-white/10 bg-slate-950 shadow-2xl"
-                                            onClick={(event) => event.stopPropagation()}
-                                            >
-                                              <button
-                                                type="button"
-                                                onClick={() => handleToggleHiddenColumn(index)}
-                                                className="flex items-center gap-2 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900"
-                                              >
-                                                <MoreHorizontal className="size-4" />
-                                                Hide
-                                              </button>
-                                              <button
-                                                type="button"
-                                                onClick={() => handleOpenHeaderEdit(index)}
-                                              className="flex items-center gap-2 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900"
-                                            >
-                                              <Pencil className="size-4" />
-                                              Edit
-                                            </button>
-                                            <button
-                                              type="button"
-                                              onClick={() => handleDeleteColumn(index)}
-                                              className="flex items-center gap-2 px-3 py-2 text-left text-xs text-rose-300 transition hover:bg-rose-500/10"
-                                            >
-                                              <Trash2 className="size-4" />
-                                              Hapus
-                                            </button>
-                                          </div>
-                                        ) : null}
-                                      </div>
-                                    ) : null}
-                                  </div>
-                                </th>
-                              ))}
-                              {weekBuckets.map((bucket) => (
-                                <th
-                                  key={bucket.label}
-                                  className={cn(
-                                    "min-w-24 bg-slate-900 border-b border-r border-white/10 px-2 py-2 text-center font-semibold last:border-r-0"
-                                  )}
-                                  style={{ fontSize: `${dayFontSizePx}px` }}
-                                >
-                                  <div className="text-slate-200" style={{ fontSize: `${dayFontSizePx}px` }}>{bucket.label}</div>
-                                  <div className="text-slate-400" style={{ fontSize: `${monthFontSizePx}px` }}>
-                                    {bucket.dates[0] ? formatShortDate(bucket.dates[0]) : ""}{" "}
-                                    {bucket.dates.at(-1) ? `- ${formatShortDate(bucket.dates.at(-1) as string)}` : ""}
-                                  </div>
-                                </th>
-                              ))}
-                            </tr>
-                          )}
-                        </thead>
-                        <tbody>
-                          {parsedGroups.map((group, groupIndex) => {
-                            const rowBaseClass = groupIndex % 2 === 0 ? "bg-slate-950" : "bg-slate-900/70";
+                            )}
+                          </thead>
+                          <tbody>
+                            {parsedGroups.map((group, groupIndex) => {
+                              const rowBaseClass = groupIndex % 2 === 0 ? "bg-slate-950" : "bg-slate-900/70";
 
-                            return (
-                              <Fragment key={group.id}>
-                                {Array.from({ length: group.rowCount }).map((_, rowIndex) => {
-                                  return (
-                                    <tr
-                                      key={`${group.id}-${rowIndex}`}
-                                      className={rowBaseClass}
-                                    >
-                                      {showNumber ? (
-                                        rowIndex === 0 ? (
-                                          <td
-                                            rowSpan={group.rowCount}
-                                            className={cn(
-                                              "border-b border-r border-white/10 text-center align-middle font-medium text-slate-300",
-                                              rowBaseClass
-                                            )}
-                                            style={dataCellStyle}
-                                          >
-                                            {groupIndex + 1}
-                                          </td>
-                                        ) : null
-                                      ) : null}
-                                      {rowIndex === 0 ? (
-                                        <td
-                                          rowSpan={group.rowCount}
-                                          className={cn(
-                                            "border-b border-r border-white/10 text-center align-middle text-slate-300",
-                                            rowBaseClass
-                                          )}
-                                          style={dataCellStyle}
-                                        >
-                                          <div className="relative flex items-center justify-center">
-                                            <button
-                                              type="button"
-                                              onClick={(event) => {
-                                                event.stopPropagation();
-                                                setOpenGroupActionId((current) => current === group.id ? null : group.id);
-                                              }}
-                                              className="flex h-8 w-8 items-center justify-center rounded-md border border-white/10 bg-slate-900 text-slate-200 transition hover:bg-slate-800"
-                                              aria-label={`Aksi grup ${groupIndex + 1}`}
-                                            >
-                                              <MoreHorizontal className="size-4" />
-                                            </button>
-                                            {openGroupActionId === group.id ? (
-                                              <div
-                                                className="absolute top-9 left-1/2 z-20 min-w-32 -translate-x-1/2 rounded-lg border border-white/10 bg-slate-950 shadow-2xl"
-                                                onClick={(event) => event.stopPropagation()}
-                                              >
-                                                <div className="group/status relative">
-                                                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900">
-                                                    <span>Status</span>
-                                                    <span className="text-slate-500">›</span>
-                                                  </div>
-                                                  <div className="invisible absolute top-0 left-full z-30 ml-1 grid min-w-36 overflow-hidden rounded-lg border border-white/10 bg-slate-950 opacity-0 shadow-2xl transition group-hover/status:visible group-hover/status:opacity-100">
-                                                    {["backlog", "progress", "done", "on hold", "remove"].map((statusOption) => (
-                                                      <button
-                                                        key={statusOption}
-                                                        type="button"
-                                                        onClick={() => {
-                                                          handleTimelineStatusChange(group.id, statusOption);
-                                                          setOpenGroupActionId(null);
-                                                        }}
-                                                        className={cn(
-                                                          "px-3 py-2 text-left text-xs transition hover:bg-slate-900",
-                                                          (group.timelineStatus ?? "backlog") === statusOption
-                                                            ? "text-white"
-                                                            : "text-slate-200"
-                                                        )}
-                                                      >
-                                                        {statusOption === "on hold"
-                                                          ? "On Hold"
-                                                          : statusOption === "remove"
-                                                            ? "Remove"
-                                                            : statusOption.charAt(0).toUpperCase() + statusOption.slice(1)}
-                                                      </button>
-                                                    ))}
-                                                  </div>
-                                                </div>
-                                              </div>
-                                            ) : null}
-                                          </div>
-                                        </td>
-                                      ) : null}
-                                      {visibleColumnIndexes.map((columnIndex) => {
-                                        const cell = group.cells[columnIndex];
-                                        const headerName = parsedTable.headers[columnIndex] || `Kolom ${columnIndex + 1}`;
-                                        const statusValue = findStatusValue(group, parsedTable.headers);
-                                        const isStatusHeader = normalizeColumnName(headerName) === "status";
-
-                                        if (!cell) {
-                                          return (
+                              return (
+                                <Fragment key={group.id}>
+                                  {Array.from({ length: group.rowCount }).map((_, rowIndex) => {
+                                    return (
+                                      <tr
+                                        key={`${group.id}-${rowIndex}`}
+                                        className={rowBaseClass}
+                                      >
+                                        {showNumber ? (
+                                          rowIndex === 0 ? (
                                             <td
-                                              key={`${group.id}-${rowIndex}-${columnIndex}`}
+                                              rowSpan={group.rowCount}
                                               className={cn(
-                                                "border-b border-r border-white/10 text-slate-500 last:border-r-0",
+                                                "border-b border-r border-white/10 text-center align-middle font-medium text-slate-300",
                                                 rowBaseClass
                                               )}
                                               style={dataCellStyle}
-                                            />
-                                          );
-                                        }
-
-                                        if (cell.mergeDown && rowIndex > 0) {
-                                          return null;
-                                        }
-
-                                        const hasMultipleItems = cell.items.length > 1;
-                                        const shouldRepeatStatus = isStatusHeader && Boolean(group.statusTargetColumn);
-                                        const value = shouldRepeatStatus
-                                          ? statusValue
-                                          : hasMultipleItems
-                                            ? cell.items[rowIndex] ?? ""
-                                            : rowIndex === 0
-                                              ? cell.value
-                                              : "";
-
-                                        return (
+                                            >
+                                              {groupIndex + 1}
+                                            </td>
+                                          ) : null
+                                        ) : null}
+                                        {rowIndex === 0 ? (
                                           <td
-                                            key={`${group.id}-${rowIndex}-${columnIndex}`}
-                                            rowSpan={cell.mergeDown ? group.rowCount : 1}
+                                            rowSpan={group.rowCount}
                                             className={cn(
-                                              "border-b border-r border-white/10 align-top text-slate-200 last:border-r-0",
-                                              isStatusHeader && "font-medium",
+                                              "border-b border-r border-white/10 text-center align-middle text-slate-300",
                                               rowBaseClass
                                             )}
                                             style={dataCellStyle}
                                           >
-                                            {isStatusHeader ? (
-                                              <span
-                                                className={cn(
-                                                  "inline-flex rounded-full border text-xs font-semibold",
-                                                  statusTone(cell.value)
-                                                )}
-                                                style={statusBadgeStyle}
+                                            <div className="relative flex items-center justify-center">
+                                              <button
+                                                type="button"
+                                                onClick={(event) => {
+                                                  event.stopPropagation();
+                                                  setOpenGroupActionId((current) => current === group.id ? null : group.id);
+                                                }}
+                                                className="flex h-8 w-8 items-center justify-center rounded-md border border-white/10 bg-slate-900 text-slate-200 transition hover:bg-slate-800"
+                                                aria-label={`Aksi grup ${groupIndex + 1}`}
                                               >
-                                                {value || "-"}
-                                              </span>
-                                            ) : (
-                                              value || <span className="text-slate-600">-</span>
-                                            )}
+                                                <MoreHorizontal className="size-4" />
+                                              </button>
+                                              {openGroupActionId === group.id ? (
+                                                <div
+                                                  className="absolute top-9 left-1/2 z-20 min-w-32 -translate-x-1/2 rounded-lg border border-white/10 bg-slate-950 shadow-2xl"
+                                                  onClick={(event) => event.stopPropagation()}
+                                                >
+                                                  <div className="group/status relative">
+                                                    <div className="flex items-center justify-between gap-3 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900">
+                                                      <span>Status</span>
+                                                      <span className="text-slate-500">›</span>
+                                                    </div>
+                                                    <div className="invisible absolute top-0 left-full z-30 ml-1 grid min-w-36 overflow-hidden rounded-lg border border-white/10 bg-slate-950 opacity-0 shadow-2xl transition group-hover/status:visible group-hover/status:opacity-100">
+                                                      {["backlog", "progress", "done", "on hold", "remove"].map((statusOption) => (
+                                                        <button
+                                                          key={statusOption}
+                                                          type="button"
+                                                          onClick={() => {
+                                                            handleTimelineStatusChange(group.id, statusOption);
+                                                            setOpenGroupActionId(null);
+                                                          }}
+                                                          className={cn(
+                                                            "px-3 py-2 text-left text-xs transition hover:bg-slate-900",
+                                                            (group.timelineStatus ?? "backlog") === statusOption
+                                                              ? "text-white"
+                                                              : "text-slate-200"
+                                                          )}
+                                                        >
+                                                          {statusOption === "on hold"
+                                                            ? "On Hold"
+                                                            : statusOption === "remove"
+                                                              ? "Remove"
+                                                              : statusOption.charAt(0).toUpperCase() + statusOption.slice(1)}
+                                                        </button>
+                                                      ))}
+                                                    </div>
+                                                  </div>
+                                                </div>
+                                              ) : null}
+                                            </div>
                                           </td>
-                                        );
-                                      })}
-                                      {timelineViewMode === "day"
-                                        ? timelineDates.map((date, dateIndex) => {
-                                          const statusValue = findStatusValue(group, parsedTable.headers);
-                                          const isActive = timelineAssignments.get(group.id)?.has(date) ?? false;
-                                          const isStartCell =
-                                            group.startIndex !== null ? group.startIndex - 1 === dateIndex : false;
-                                          const isManual = group.manualIndices.includes(dateIndex + 1);
+                                        ) : null}
+                                        {visibleColumnIndexes.map((columnIndex) => {
+                                          const cell = group.cells[columnIndex];
+                                        const headerName = parsedTable.headers[columnIndex] || `Kolom ${columnIndex + 1}`;
+                                        const statusValue = findStatusValue(group, parsedTable.headers);
+                                        const isStatusHeader = normalizeColumnName(headerName) === "status";
+                                        const columnAlignment = columnAlignments[String(columnIndex)] ?? "top";
+                                        const cellKey = `${group.id}:${columnIndex}`;
+                                        const autoMergeRowSpan = autoMergeMap.rowSpanMap.get(cellKey);
+                                        const isCoveredByAutoMerge = autoMergeMap.coveredMap.has(cellKey);
+
+                                          if (isCoveredByAutoMerge) {
+                                            return null;
+                                          }
+
+                                          if (!cell) {
+                                            return (
+                                              <td
+                                                key={`${group.id}-${rowIndex}-${columnIndex}`}
+                                                className={cn(
+                                                  "border-b border-r border-white/10 text-slate-500 last:border-r-0",
+                                                  rowBaseClass
+                                                )}
+                                                style={dataCellStyle}
+                                              />
+                                            );
+                                          }
+
+                                          if (cell.mergeDown && rowIndex > 0) {
+                                            return null;
+                                          }
+
+                                          if (cell.mergeAuto && rowIndex > 0) {
+                                            return null;
+                                          }
+
+                                          const hasMultipleItems = cell.items.length > 1;
+                                          const shouldRepeatStatus = isStatusHeader && Boolean(group.statusTargetColumn);
+                                          const value = shouldRepeatStatus
+                                            ? statusValue
+                                            : hasMultipleItems
+                                              ? cell.items[rowIndex] ?? ""
+                                              : rowIndex === 0
+                                                ? cell.value
+                                                : "";
 
                                           return (
                                             <td
-                                              key={`${group.id}-${rowIndex}-${date}`}
-                                              onMouseDown={(event) =>
-                                                handleTimelineMouseDown(
-                                                  event,
-                                                  group,
-                                                  dateIndex + 1,
-                                                  isActive,
-                                                  isManual
-                                                )
+                                              key={`${group.id}-${rowIndex}-${columnIndex}`}
+                                              rowSpan={
+                                                autoMergeRowSpan ??
+                                                (cell.mergeDown ? group.rowCount : 1)
                                               }
-                                              onMouseEnter={() => handleTimelineMouseEnter(group, dateIndex + 1)}
-                                              className={cn(
-                                                "cursor-pointer border-b border-r border-white/10 text-center transition hover:bg-sky-500/10 last:border-r-0",
-                                                isActive
-                                                  ? getTimelineCellAppearance(group.timelineStatus, statusValue)
-                                                  : rowBaseClass
-                                              )}
-                                              style={timelineCellStyle}
+                                            className={cn(
+                                              "border-b border-r border-white/10 text-slate-200 last:border-r-0",
+                                              cell.mergeDown || cell.mergeAuto
+                                                ? columnAlignment === "bottom"
+                                                  ? "align-bottom text-center"
+                                                  : columnAlignment === "middle"
+                                                    ? "align-middle text-center"
+                                                    : "align-top text-center"
+                                                : columnAlignment === "bottom"
+                                                  ? "align-bottom"
+                                                  : columnAlignment === "middle"
+                                                    ? "align-middle"
+                                                    : "align-top",
+                                              isStatusHeader && "font-medium",
+                                              rowBaseClass
+                                            )}
+                                              style={dataCellStyle}
                                             >
-                                              <div
-                                                className={cn(
-                                                  "rounded-sm border",
-                                                  isActive || isStartCell ? "border-white/20" : "border-transparent",
-                                                  isActive ? "opacity-100" : "opacity-0"
-                                                )}
-                                                style={{ minHeight: `${timelineCellMinHeightPx}px` }}
-                                              >
-                                                &nbsp;
-                                              </div>
-                                            </td>
-                                          );
-                                        })
-                                        : weekBuckets.map((bucket) => {
-                                          const activeDates = bucket.dates.filter((date) =>
-                                            timelineAssignments.get(group.id)?.has(date)
-                                          );
-                                          const statuses = activeDates.map(() => group.timelineStatus || findStatusValue(group, parsedTable.headers) || "backlog");
-                                          const isActive = activeDates.length > 0;
-
-                                          return (
-                                            <td
-                                              key={`${group.id}-${bucket.label}`}
-                                              className={cn(
-                                                "min-w-24 border-b border-r border-white/10 px-2 py-2 text-center last:border-r-0",
-                                                isActive ? getWeeklyCellAppearance(statuses) : rowBaseClass
+                                              {isStatusHeader ? (
+                                                <span
+                                                  className={cn(
+                                                    "inline-flex rounded-full border text-xs font-semibold",
+                                                    statusTone(cell.value)
+                                                  )}
+                                                  style={statusBadgeStyle}
+                                                >
+                                                  {value || "-"}
+                                                </span>
+                                              ) : (
+                                                value || <span className="text-slate-600">-</span>
                                               )}
-                                            >
-                                              <div
-                                                className={cn(
-                                                  "min-h-9 rounded-md border",
-                                                  isActive ? "border-white/20 opacity-100" : "border-transparent opacity-0"
-                                                )}
-                                              >
-                                                &nbsp;
-                                              </div>
                                             </td>
                                           );
                                         })}
-                                    </tr>
-                                  );
-                                })}
-                              </Fragment>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    );
-                  })()}
-                </div>
-              </div>
+                                        {timelineViewMode === "day"
+                                          ? timelineDates.map((date, dateIndex) => {
+                                            const statusValue = findStatusValue(group, parsedTable.headers);
+                                            const isActive = timelineAssignments.get(group.id)?.has(date) ?? false;
+                                            const isStartCell =
+                                              group.startIndex !== null ? group.startIndex - 1 === dateIndex : false;
+                                            const isManual = group.manualIndices.includes(dateIndex + 1);
 
-              <div className="grid gap-3 rounded-2xl bg-slate-950 p-4 text-slate-200 md:grid-cols-3">
-                <div>
-                  <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Input mode</div>
-                  <div className="mt-1 text-lg font-semibold text-white">Raw first</div>
-                </div>
-                <div>
-                  <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Render mode</div>
-                  <div className="mt-1 text-sm leading-6">
-                    Per hari, default 30 hari, lalu auto-fill dari kolom acuan dan jumlah hari per task.
+                                            return (
+                                              <td
+                                                key={`${group.id}-${rowIndex}-${date}`}
+                                                onMouseDown={(event) =>
+                                                  handleTimelineMouseDown(
+                                                    event,
+                                                    group,
+                                                    dateIndex + 1,
+                                                    isActive,
+                                                    isManual
+                                                  )
+                                                }
+                                                onMouseEnter={() => handleTimelineMouseEnter(group, dateIndex + 1)}
+                                                className={cn(
+                                                  "cursor-pointer border-b border-r border-white/10 text-center transition hover:bg-sky-500/10 last:border-r-0",
+                                                  isActive
+                                                    ? getTimelineCellAppearance(group.timelineStatus, statusValue)
+                                                    : rowBaseClass
+                                                )}
+                                                style={timelineCellStyle}
+                                              >
+                                                <div
+                                                  className={cn(
+                                                    "rounded-sm border",
+                                                    isActive || isStartCell ? "border-white/20" : "border-transparent",
+                                                    isActive ? "opacity-100" : "opacity-0"
+                                                  )}
+                                                  style={{ minHeight: `${timelineCellMinHeightPx}px` }}
+                                                >
+                                                  &nbsp;
+                                                </div>
+                                              </td>
+                                            );
+                                          })
+                                          : weekBuckets.map((bucket) => {
+                                            const activeDates = bucket.dates.filter((date) =>
+                                              timelineAssignments.get(group.id)?.has(date)
+                                            );
+                                            const statuses = activeDates.map(() => group.timelineStatus || findStatusValue(group, parsedTable.headers) || "backlog");
+                                            const isActive = activeDates.length > 0;
+
+                                            return (
+                                              <td
+                                                key={`${group.id}-${bucket.label}`}
+                                                className={cn(
+                                                  "min-w-24 border-b border-r border-white/10 px-2 py-2 text-center last:border-r-0",
+                                                  isActive ? getWeeklyCellAppearance(statuses) : rowBaseClass
+                                                )}
+                                              >
+                                                <div
+                                                  className={cn(
+                                                    "min-h-9 rounded-md border",
+                                                    isActive ? "border-white/20 opacity-100" : "border-transparent opacity-0"
+                                                  )}
+                                                >
+                                                  &nbsp;
+                                                </div>
+                                              </td>
+                                            );
+                                          })}
+                                      </tr>
+                                    );
+                                  })}
+                                </Fragment>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      );
+                    })()}
                   </div>
                 </div>
-                <div>
-                  <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Next step</div>
-                  <div className="mt-1 text-sm leading-6">
-                    Setelah fondasi harian ini enak, baru kita tambah mode week dan month.
+
+                <div className="grid gap-3 rounded-2xl bg-slate-950 p-4 text-slate-200 md:grid-cols-3">
+                  <div>
+                    <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Input mode</div>
+                    <div className="mt-1 text-lg font-semibold text-white">Raw first</div>
+                  </div>
+                  <div>
+                    <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Render mode</div>
+                    <div className="mt-1 text-sm leading-6">
+                      Per hari, default 30 hari, lalu auto-fill dari kolom acuan dan jumlah hari per task.
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Next step</div>
+                    <div className="mt-1 text-sm leading-6">
+                      Setelah fondasi harian ini enak, baru kita tambah mode week dan month.
+                    </div>
                   </div>
                 </div>
-              </div>
-            </CardContent>
-          </Card>
-        </section>
-      </div>
+              </CardContent>
+            </Card>
+          </section>
+        </div>
 
-      <AppModal
-        open={isTimelineSettingsOpen}
-        onOpenChange={setIsTimelineSettingsOpen}
-        title="Timeline Global"
-        description="Atur tanggal mulai, durasi, view timeline, dan opsi global lainnya."
-      >
-        <div className="grid gap-4">
-          <div className="grid gap-1.5 text-sm">
-            <span className="text-slate-300">Tanggal mulai</span>
-            <div className="grid grid-cols-[72px_72px_1fr] gap-2">
-              <Input
-                inputMode="numeric"
-                placeholder="03"
-                value={timelineStartParts.day}
-                onChange={(event) => handleTimelinePartChange("day", event.target.value)}
-                className="border-slate-700 bg-slate-900 text-center text-white"
-              />
-              <Input
-                inputMode="numeric"
-                placeholder="06"
-                value={timelineStartParts.month}
-                onChange={(event) => handleTimelinePartChange("month", event.target.value)}
-                className="border-slate-700 bg-slate-900 text-center text-white"
-              />
-              <Input
-                inputMode="numeric"
-                placeholder="2026"
-                value={timelineStartParts.year}
-                onChange={(event) => handleTimelinePartChange("year", event.target.value)}
-                className="border-slate-700 bg-slate-900 text-center text-white"
-              />
-            </div>
-          </div>
-
-          <div className="grid gap-1.5 text-sm">
-            <span className="text-slate-300">Progress harian</span>
-            <div className="grid grid-cols-[96px_1fr] gap-2">
-              <Input
-                inputMode="numeric"
-                value={timelineTargetAmount}
-                onChange={(event) =>
-                  setTimelineTargetAmount(event.target.value.replace(/\D/g, "").slice(0, 3))
-                }
-                className="border-slate-700 bg-slate-900 text-center text-white"
-              />
-              <div className="flex h-9 items-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-slate-200">
-                hari
+        <AppModal
+          open={isTimelineSettingsOpen}
+          onOpenChange={setIsTimelineSettingsOpen}
+          title="Timeline Global"
+          description="Atur tanggal mulai, durasi, view timeline, dan opsi global lainnya."
+        >
+          <div className="grid gap-4">
+            <div className="grid gap-1.5 text-sm">
+              <span className="text-slate-300">Tanggal mulai</span>
+              <div className="grid grid-cols-[72px_72px_1fr] gap-2">
+                <Input
+                  inputMode="numeric"
+                  placeholder="03"
+                  value={timelineStartParts.day}
+                  onChange={(event) => handleTimelinePartChange("day", event.target.value)}
+                  className="border-slate-700 bg-slate-900 text-center text-white"
+                />
+                <Input
+                  inputMode="numeric"
+                  placeholder="06"
+                  value={timelineStartParts.month}
+                  onChange={(event) => handleTimelinePartChange("month", event.target.value)}
+                  className="border-slate-700 bg-slate-900 text-center text-white"
+                />
+                <Input
+                  inputMode="numeric"
+                  placeholder="2026"
+                  value={timelineStartParts.year}
+                  onChange={(event) => handleTimelinePartChange("year", event.target.value)}
+                  className="border-slate-700 bg-slate-900 text-center text-white"
+                />
               </div>
             </div>
-          </div>
 
-          <div className="grid gap-1.5 text-sm">
-            <span className="text-slate-300">Kolom acuan task</span>
-            <select
-              value={timelineTargetColumn}
-              onChange={(event) => setTimelineTargetColumn(event.target.value)}
-              className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-            >
-              {parsedTable.headers.map((header) => (
-                <option key={header} value={header}>
-                  {header}
-                </option>
-              ))}
-            </select>
-            {parsedTable.timelineHeader ? (
-              <p className="text-xs text-slate-400">
-                Header `;timeline` aktif: timeline otomatis mengacu ke `{parsedTable.timelineHeader}`.
-              </p>
-            ) : null}
-          </div>
+            <div className="grid gap-1.5 text-sm">
+              <span className="text-slate-300">Progress harian</span>
+              <div className="grid grid-cols-[96px_1fr] gap-2">
+                <Input
+                  inputMode="numeric"
+                  value={timelineTargetAmount}
+                  onChange={(event) =>
+                    setTimelineTargetAmount(event.target.value.replace(/\D/g, "").slice(0, 3))
+                  }
+                  className="border-slate-700 bg-slate-900 text-center text-white"
+                />
+                <div className="flex h-9 items-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-slate-200">
+                  hari
+                </div>
+              </div>
+            </div>
 
-          <div className="grid gap-1.5 text-sm">
-            <span className="text-slate-300">Per task berapa hari</span>
-            <select
-              value={timelineTaskDays}
-              onChange={(event) => setTimelineTaskDays(event.target.value)}
-              className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-            >
-              {Array.from({ length: 14 }).map((_, index) => {
-                const value = String(index + 1);
-                return (
-                  <option key={value} value={value}>
-                    {value} hari
+            <div className="grid gap-1.5 text-sm">
+              <span className="text-slate-300">Kolom acuan task</span>
+              <select
+                value={timelineTargetColumn}
+                onChange={(event) => setTimelineTargetColumn(event.target.value)}
+                className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+              >
+                {parsedTable.headers.map((header) => (
+                  <option key={header} value={header}>
+                    {header}
                   </option>
-                );
-              })}
-            </select>
-          </div>
-
-          <div className="grid gap-1.5 text-sm">
-            <span className="text-slate-300">View timeline</span>
-            <select
-              value={timelineViewMode}
-              onChange={(event) => setTimelineViewMode(event.target.value as TimelineViewMode)}
-              className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-            >
-              <option value="day">Daily</option>
-              <option value="week">Weekly</option>
-            </select>
-          </div>
-
-          {parsedTimelineStart ? (
-            <div className="grid gap-1 rounded-xl border border-white/10 bg-slate-900/70 p-4 text-sm text-slate-300">
-              <p>
-                Range otomatis: <span className="font-semibold text-white">{formatLongDate(timelineStart)}</span>{" "}
-                sampai <span className="font-semibold text-white">{formatLongDate(timelineEnd)}</span>
-              </p>
-              <p>
-                Render awal pakai <span className="font-semibold text-white">{timelineDates.length} hari</span>.
-              </p>
-              <p>
-                Mode aktif: <span className="font-semibold text-white">{timelineViewMode === "day" ? "Daily" : "Weekly"}</span>
-              </p>
-              <p>
-                Font table:{" "}
-                <span className="font-semibold text-white">
-                  {tableFontSize}px
-                </span>
-              </p>
-              <p>
-                Padding value:{" "}
-                <span className="font-semibold text-white">
-                  {tableCellPaddingX}px x {tableCellPaddingY}px
-                </span>
-              </p>
+                ))}
+              </select>
+              {parsedTable.timelineHeader ? (
+                <p className="text-xs text-slate-400">
+                  Header `;timeline` aktif: timeline otomatis mengacu ke `{parsedTable.timelineHeader}`.
+                </p>
+              ) : null}
             </div>
-          ) : (
-            <p className="text-sm text-amber-300">
-              Isi tanggal mulai valid dulu supaya target timeline bisa dihitung otomatis.
-            </p>
-          )}
+
+            <div className="grid gap-1.5 text-sm">
+              <span className="text-slate-300">Per task berapa hari</span>
+              <select
+                value={timelineTaskDays}
+                onChange={(event) => setTimelineTaskDays(event.target.value)}
+                className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+              >
+                {Array.from({ length: 14 }).map((_, index) => {
+                  const value = String(index + 1);
+                  return (
+                    <option key={value} value={value}>
+                      {value} hari
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+
+            <div className="grid gap-1.5 text-sm">
+              <span className="text-slate-300">View timeline</span>
+              <select
+                value={timelineViewMode}
+                onChange={(event) => setTimelineViewMode(event.target.value as TimelineViewMode)}
+                className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+              >
+                <option value="day">Daily</option>
+                <option value="week">Weekly</option>
+              </select>
+            </div>
+
+            {parsedTimelineStart ? (
+              <div className="grid gap-1 rounded-xl border border-white/10 bg-slate-900/70 p-4 text-sm text-slate-300">
+                <p>
+                  Range otomatis: <span className="font-semibold text-white">{formatLongDate(timelineStart)}</span>{" "}
+                  sampai <span className="font-semibold text-white">{formatLongDate(timelineEnd)}</span>
+                </p>
+                <p>
+                  Render awal pakai <span className="font-semibold text-white">{timelineDates.length} hari</span>.
+                </p>
+                <p>
+                  Mode aktif: <span className="font-semibold text-white">{timelineViewMode === "day" ? "Daily" : "Weekly"}</span>
+                </p>
+                <p>
+                  Font table:{" "}
+                  <span className="font-semibold text-white">
+                    {tableFontSize}px
+                  </span>
+                </p>
+                <p>
+                  Padding value:{" "}
+                  <span className="font-semibold text-white">
+                    {tableCellPaddingX}px x {tableCellPaddingY}px
+                  </span>
+                </p>
+              </div>
+            ) : (
+              <p className="text-sm text-amber-300">
+                Isi tanggal mulai valid dulu supaya target timeline bisa dihitung otomatis.
+              </p>
+            )}
+          </div>
+        </AppModal>
+
+        <AppModal
+          open={isRawInputOpen}
+          onOpenChange={setIsRawInputOpen}
+          title="Input Mentah"
+          description="Edit raw input penuh di sini, lalu render ulang untuk melihat hasil table terbaru."
+          dialogClassName="h-[92vh] max-w-[calc(100%-2rem)] sm:max-w-6xl"
+          contentClassName="flex-1"
+          footer={
+            <>
+              <Button variant="outline" onClick={() => setIsRawInputOpen(false)}>
+                Tutup
+              </Button>
+              <Button variant="outline" onClick={() => setIsParserDialogOpen(true)}>
+                Aturan parser
+              </Button>
+              <Button onClick={handleSubmitRawInput}>Render table</Button>
+            </>
+          }
+        >
+          <Textarea
+            value={rawInput}
+            onChange={(event) => setRawInput(event.target.value)}
+            className="min-h-full border-white/10 bg-slate-900 font-mono text-sm text-white"
+            placeholder="migrasiFunctionA;m | fileA,fileB,fileC,fileD | on progress | deskripsi"
+          />
+        </AppModal>
+
+        <AppModal
+          open={Boolean(editingHeader)}
+          onOpenChange={(open) => !open && setEditingHeader(null)}
+          title="Edit Header Kolom"
+          description="Ubah nama kolom langsung dari header table. Nilai di bawahnya tetap dipertahankan."
+          footer={
+            <>
+              <Button variant="outline" onClick={() => setEditingHeader(null)}>
+                Batal
+              </Button>
+              <Button onClick={handleSaveHeaderEdit}>Simpan</Button>
+            </>
+          }
+        >
+          <Input
+            value={editingHeaderDraft}
+            onChange={(event) => setEditingHeaderDraft(event.target.value)}
+            className="border-white/10 bg-slate-900 text-white"
+          />
+        </AppModal>
+
+        <AppModal
+          open={isParserDialogOpen}
+          onOpenChange={setIsParserDialogOpen}
+          title="Aturan Parser"
+          description="Referensi cepat untuk format raw input dan interaksi timeline."
+        >
+          <div className="grid gap-3 text-sm text-slate-300">
+            <div>baris pertama = nama kolom / header table</div>
+            <div>`|` = pindah ke kolom berikutnya</div>
+            <div>`,` = item banyak di dalam satu grup</div>
+          <div>`;m` = kolom sebelumnya di-merge vertikal mengikuti jumlah item dalam grup yang sama</div>
+          <div>`;ma` = merge auto ke bawah sampai ketemu value berikutnya di kolom yang sama</div>
+          <div>`;ma` juga bantu auto-koreksi baris pendek saat render, jadi kolom kosong akan disisipkan otomatis</div>
+            <div>`;status=NamaKolom` = status akan ditempel ke kolom header yang dipilih</div>
+            <div>`;timeline` di header = tandai kolom acuan timeline, contoh `Task;timeline`</div>
+            <div>`;start=Angka` = posisi mulai timeline hasil klik otomatis akan disimpan ke raw input</div>
+            <div>`;manual=2,5,9` = tambahan slot harian manual hasil `Shift+Click`</div>
+            <div>Export JSON = simpan seluruh setting dan raw input yang sudah disesuaikan</div>
+            <div>Import JSON = overwrite state aktif sesuai isi snapshot JSON</div>
+            <div className="text-slate-400">
+              Contoh:
+              `Task;timeline | Files | Status | Deskripsi`
+            </div>
+            <div className="text-slate-400">
+              `migrasiFunctionA;m;status=Task;start=1;manual=4 | fileA,fileB,fileC,fileD | on progress | deskripsi`
+            </div>
+            <div className="text-slate-400">
+              `Feature A;ma | controller-a | planned | desc`
+            </div>
+            <div className="text-slate-400">klik biasa = tidak mengubah timeline</div>
+            <div className="text-slate-400">`Ctrl+Click` = geser task, `Shift+Click` = tambah/hapus hari manual</div>
+            <div className="text-slate-400">tahan `Shift` lalu drag = isi beberapa slot manual sekaligus</div>
+          </div>
+        </AppModal>
+
+        <AppModal
+          open={isImportDialogOpen}
+          onOpenChange={setIsImportDialogOpen}
+          title="Import Snapshot JSON"
+          description="Paste JSON snapshot di bawah ini. Import akan meng-overwrite semua data aktif."
+          footer={
+            <>
+              <Button variant="outline" onClick={() => setIsImportDialogOpen(false)}>
+                Batal
+              </Button>
+              <Button className="bg-sky-500 text-white hover:bg-sky-400" onClick={handleImportJson}>
+                Import dan Override
+              </Button>
+            </>
+          }
+          contentClassName="max-h-[55vh]"
+        >
+          <div className="grid gap-4">
+            <div className="grid gap-2">
+              <label className="text-sm text-slate-300">Pilih file JSON</label>
+              <Input
+                type="file"
+                accept=".json,application/json"
+                onChange={handleImportFileChange}
+                className="border-white/10 bg-slate-900 text-white file:mr-3 file:rounded-md file:border-0 file:bg-sky-500 file:px-3 file:py-1 file:text-white"
+              />
+            </div>
+            <div className="grid gap-2">
+              <label className="text-sm text-slate-300">Konten JSON</label>
+              <Textarea
+                value={importDraft}
+                onChange={(event) => setImportDraft(event.target.value)}
+                className="min-h-56 border-white/10 bg-slate-900 font-mono text-sm text-white"
+                placeholder='{"version":1,"timelineStartParts":{"day":"12","month":"03","year":"2026"}}'
+              />
+            </div>
+            {importError ? <div className="text-sm text-rose-300">{importError}</div> : null}
+          </div>
+        </AppModal>
         </div>
-      </AppModal>
-
-      <AppModal
-        open={isRawInputOpen}
-        onOpenChange={setIsRawInputOpen}
-        title="Input Mentah"
-        description="Edit raw input penuh di sini, lalu render ulang untuk melihat hasil table terbaru."
-        dialogClassName="h-[92vh] max-w-[calc(100%-2rem)] sm:max-w-6xl"
-        contentClassName="flex-1"
-        footer={
-          <>
-            <Button variant="outline" onClick={() => setIsRawInputOpen(false)}>
-              Tutup
-            </Button>
-            <Button variant="outline" onClick={() => setIsParserDialogOpen(true)}>
-              Aturan parser
-            </Button>
-            <Button onClick={handleSubmitRawInput}>Render table</Button>
-          </>
-        }
-      >
-        <Textarea
-          value={rawInput}
-          onChange={(event) => setRawInput(event.target.value)}
-          className="min-h-full border-white/10 bg-slate-900 font-mono text-sm text-white"
-          placeholder="migrasiFunctionA;m | fileA,fileB,fileC,fileD | on progress | deskripsi"
-        />
-      </AppModal>
-
-      <AppModal
-        open={Boolean(editingHeader)}
-        onOpenChange={(open) => !open && setEditingHeader(null)}
-        title="Edit Header Kolom"
-        description="Ubah nama kolom langsung dari header table. Nilai di bawahnya tetap dipertahankan."
-        footer={
-          <>
-            <Button variant="outline" onClick={() => setEditingHeader(null)}>
-              Batal
-            </Button>
-            <Button onClick={handleSaveHeaderEdit}>Simpan</Button>
-          </>
-        }
-      >
-        <Input
-          value={editingHeaderDraft}
-          onChange={(event) => setEditingHeaderDraft(event.target.value)}
-          className="border-white/10 bg-slate-900 text-white"
-        />
-      </AppModal>
-
-      <AppModal
-        open={isParserDialogOpen}
-        onOpenChange={setIsParserDialogOpen}
-        title="Aturan Parser"
-        description="Referensi cepat untuk format raw input dan interaksi timeline."
-      >
-        <div className="grid gap-3 text-sm text-slate-300">
-          <div>baris pertama = nama kolom / header table</div>
-          <div>`|` = pindah ke kolom berikutnya</div>
-          <div>`,` = item banyak di dalam satu grup</div>
-          <div>`;m` = kolom sebelumnya di-merge vertikal mengikuti jumlah item</div>
-          <div>`;status=NamaKolom` = status akan ditempel ke kolom header yang dipilih</div>
-          <div>`;timeline` di header = tandai kolom acuan timeline, contoh `Task;timeline`</div>
-          <div>`;start=Angka` = posisi mulai timeline hasil klik otomatis akan disimpan ke raw input</div>
-          <div>`;manual=2,5,9` = tambahan slot harian manual hasil `Shift+Click`</div>
-          <div>Export JSON = simpan seluruh setting dan raw input yang sudah disesuaikan</div>
-          <div>Import JSON = overwrite state aktif sesuai isi snapshot JSON</div>
-          <div className="text-slate-400">
-            Contoh:
-            `Task;timeline | Files | Status | Deskripsi`
-          </div>
-          <div className="text-slate-400">
-            `migrasiFunctionA;m;status=Task;start=1;manual=4 | fileA,fileB,fileC,fileD | on progress | deskripsi`
-          </div>
-          <div className="text-slate-400">klik biasa = tidak mengubah timeline</div>
-          <div className="text-slate-400">`Ctrl+Click` = geser task, `Shift+Click` = tambah/hapus hari manual</div>
-          <div className="text-slate-400">tahan `Shift` lalu drag = isi beberapa slot manual sekaligus</div>
-        </div>
-      </AppModal>
-
-      <AppModal
-        open={isImportDialogOpen}
-        onOpenChange={setIsImportDialogOpen}
-        title="Import Snapshot JSON"
-        description="Paste JSON snapshot di bawah ini. Import akan meng-overwrite semua data aktif."
-        footer={
-          <>
-            <Button variant="outline" onClick={() => setIsImportDialogOpen(false)}>
-              Batal
-            </Button>
-            <Button className="bg-sky-500 text-white hover:bg-sky-400" onClick={handleImportJson}>
-              Import dan Override
-            </Button>
-          </>
-        }
-        contentClassName="max-h-[55vh]"
-      >
-        <div className="grid gap-4">
-          <div className="grid gap-2">
-            <label className="text-sm text-slate-300">Pilih file JSON</label>
-            <Input
-              type="file"
-              accept=".json,application/json"
-              onChange={handleImportFileChange}
-              className="border-white/10 bg-slate-900 text-white file:mr-3 file:rounded-md file:border-0 file:bg-sky-500 file:px-3 file:py-1 file:text-white"
-            />
-          </div>
-          <div className="grid gap-2">
-            <label className="text-sm text-slate-300">Konten JSON</label>
-            <Textarea
-              value={importDraft}
-              onChange={(event) => setImportDraft(event.target.value)}
-              className="min-h-56 border-white/10 bg-slate-900 font-mono text-sm text-white"
-              placeholder='{"version":1,"timelineStartParts":{"day":"12","month":"03","year":"2026"}}'
-            />
-          </div>
-          {importError ? <div className="text-sm text-rose-300">{importError}</div> : null}
-        </div>
-      </AppModal>
     </main>
   );
 }
