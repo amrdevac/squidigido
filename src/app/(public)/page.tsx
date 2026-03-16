@@ -1,17 +1,12 @@
 import { Metadata } from "next";
-import LandingPage from "@/components/contents/LandingPageContent";
-import ExampleServiceShowcase from "@/components/examples/ExampleServiceShowcase";
+
+import TimelinePlanner from "@/components/contents/TimelinePlanner";
 
 export const metadata: Metadata = {
-  title: "Next.js Boiler Home",
-  description: "Boilerplate landing page plus hook + API contoh.",
+  title: "Timeline Planner",
+  description: "Prototype aplikasi planning task harian dengan timeline otomatis.",
 };
 
 export default function Home() {
-  return (
-    <main className="flex flex-col gap-16 pb-16">
-      <LandingPage />
-      <ExampleServiceShowcase />
-    </main>
-  );
+  return <TimelinePlanner />;
 }
