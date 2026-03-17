@@ -4,23 +4,26 @@ import type { ReactNode } from "react";
 
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  DialogTrigger,
 } from "@/ui/dialog";
 import { cn } from "@/lib/utils";
 
 type AppModalProps = {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   title: string;
   description?: string;
   children: ReactNode;
   footer?: ReactNode;
   contentClassName?: string;
   dialogClassName?: string;
+  trigger?: ReactNode;
 };
 
 export default function AppModal({
@@ -32,9 +35,11 @@ export default function AppModal({
   footer,
   contentClassName,
   dialogClassName,
+  trigger,
 }: AppModalProps) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
+      {trigger ? <DialogTrigger asChild>{trigger}</DialogTrigger> : null}
       <DialogContent
         className={cn(
           "flex max-h-[85vh] flex-col border-white/10 bg-slate-950 p-0 text-slate-100",
@@ -51,3 +56,5 @@ export default function AppModal({
     </Dialog>
   );
 }
+
+export { DialogClose };

@@ -16,6 +16,7 @@ import { CalendarRange, Download, MoreHorizontal, MoreVertical, Pencil, Sparkles
 import { Button } from "@/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/ui/card";
 import AppModal from "@/components/shared/AppModal";
+import { DialogClose } from "@/ui/dialog";
 import { Input } from "@/ui/input";
 import { Textarea } from "@/ui/textarea";
 import { cn } from "@/lib/utils";
@@ -23,6 +24,8 @@ import { cn } from "@/lib/utils";
 type DurationUnit = "day" | "week" | "month";
 type TimelineViewMode = "day" | "week";
 type ColumnVerticalAlign = "top" | "middle" | "bottom";
+type ColumnValueDisplayMode = "horizontal" | "vertical";
+type ExcelExportTheme = "dark" | "light";
 
 type RawCell = {
   value: string;
@@ -73,6 +76,8 @@ type TimelinePlannerSnapshot = {
   tableCellPaddingY?: string;
   hiddenColumnIndexes?: number[];
   columnAlignments?: Record<string, ColumnVerticalAlign>;
+  columnValueModes?: Record<string, ColumnValueDisplayMode>;
+  columnHeaderModes?: Record<string, ColumnValueDisplayMode>;
   showNumber: boolean;
   rawInput: string;
 };
@@ -400,6 +405,355 @@ function normalizeRawInputStructure(input: string) {
   });
 
   return normalizedLines.join("\n");
+}
+
+function shiftIndexedRecord<T>(source: Record<string, T>, removedIndex: number) {
+  return Object.entries(source).reduce<Record<string, T>>((accumulator, [key, value]) => {
+    const numericKey = Number(key);
+
+    if (!Number.isInteger(numericKey) || numericKey === removedIndex) {
+      return accumulator;
+    }
+
+    accumulator[String(numericKey > removedIndex ? numericKey - 1 : numericKey)] = value;
+    return accumulator;
+  }, {});
+}
+
+function ensureMatrixCell(matrix: Array<Array<string | number>>, rowIndex: number, columnIndex: number) {
+  while (matrix.length <= rowIndex) {
+    matrix.push([]);
+  }
+
+  while (matrix[rowIndex].length <= columnIndex) {
+    matrix[rowIndex].push("");
+  }
+}
+
+function setMatrixCell(
+  matrix: Array<Array<string | number>>,
+  rowIndex: number,
+  columnIndex: number,
+  value: string | number
+) {
+  ensureMatrixCell(matrix, rowIndex, columnIndex);
+  matrix[rowIndex][columnIndex] = value;
+}
+
+function estimateExportColumnWidthPx(
+  columnIndex: number,
+  headers: string[],
+  groups: ParsedGroup[],
+  columnValueModes: Record<string, ColumnValueDisplayMode>
+) {
+  if ((columnValueModes[String(columnIndex)] ?? "horizontal") === "vertical") {
+    return 72;
+  }
+
+  let maxLength = (headers[columnIndex] || `Kolom ${columnIndex + 1}`).length;
+
+  groups.forEach((group) => {
+    const cell = group.cells[columnIndex];
+    if (!cell) {
+      return;
+    }
+
+    maxLength = Math.max(
+      maxLength,
+      cell.value.length,
+      ...cell.items.map((item) => item.length)
+    );
+  });
+
+  return Math.min(320, Math.max(120, maxLength * 8 + 28));
+}
+
+function buildExcelExportModel({
+  showNumber,
+  visibleColumnIndexes,
+  parsedTable,
+  parsedGroups,
+  columnValueModes,
+  timelineViewMode,
+  timelineDates,
+  timelineAssignments,
+  autoMergeMap,
+  timelineCellMinWidthPx,
+}: {
+  showNumber: boolean;
+  visibleColumnIndexes: number[];
+  parsedTable: ParsedTable;
+  parsedGroups: ParsedGroup[];
+  columnValueModes: Record<string, ColumnValueDisplayMode>;
+  timelineViewMode: TimelineViewMode;
+  timelineDates: string[];
+  timelineAssignments: Map<string, Set<string>>;
+  autoMergeMap: ReturnType<typeof buildAutoMergeMap>;
+  timelineCellMinWidthPx: number;
+}) {
+  const rows: Array<Array<string | number>> = [];
+  const merges: Array<{ s: { r: number; c: number }; e: { r: number; c: number } }> = [];
+  const cols: Array<{ wpx: number }> = [];
+  const leadingColumnCount = (showNumber ? 1 : 0) + visibleColumnIndexes.length;
+  const weekBuckets = createWeekBuckets(timelineDates);
+  const monthBuckets = createMonthBuckets(timelineDates);
+  const bodyStartRow = timelineViewMode === "day" ? 2 : 1;
+
+  if (showNumber) {
+    cols.push({ wpx: 64 });
+  }
+
+  visibleColumnIndexes.forEach((columnIndex) => {
+    cols.push({
+      wpx: estimateExportColumnWidthPx(columnIndex, parsedTable.headers, parsedGroups, columnValueModes),
+    });
+  });
+
+  if (timelineViewMode === "day") {
+    timelineDates.forEach(() => {
+      cols.push({ wpx: timelineCellMinWidthPx });
+    });
+  } else {
+    weekBuckets.forEach(() => {
+      cols.push({ wpx: Math.max(96, timelineCellMinWidthPx * 2) });
+    });
+  }
+
+  let currentColumn = 0;
+
+  if (showNumber) {
+    setMatrixCell(rows, 0, currentColumn, "No");
+    if (timelineViewMode === "day") {
+      merges.push({ s: { r: 0, c: currentColumn }, e: { r: 1, c: currentColumn } });
+    }
+    currentColumn += 1;
+  }
+
+  visibleColumnIndexes.forEach((columnIndex) => {
+    setMatrixCell(rows, 0, currentColumn, parsedTable.headers[columnIndex] || `Kolom ${columnIndex + 1}`);
+    if (timelineViewMode === "day") {
+      merges.push({ s: { r: 0, c: currentColumn }, e: { r: 1, c: currentColumn } });
+    }
+    currentColumn += 1;
+  });
+
+  if (timelineViewMode === "day") {
+    let timelineColumn = leadingColumnCount;
+
+    monthBuckets.forEach((bucket) => {
+      setMatrixCell(rows, 0, timelineColumn, bucket.label);
+
+      if (bucket.dates.length > 1) {
+        merges.push({
+          s: { r: 0, c: timelineColumn },
+          e: { r: 0, c: timelineColumn + bucket.dates.length - 1 },
+        });
+      }
+
+      bucket.dates.forEach((date, dateIndex) => {
+        setMatrixCell(rows, 1, timelineColumn + dateIndex, formatDayNumber(date));
+      });
+
+      timelineColumn += bucket.dates.length;
+    });
+  } else {
+    weekBuckets.forEach((bucket, bucketIndex) => {
+      const label = bucket.dates[0]
+        ? `${bucket.label} (${formatShortDate(bucket.dates[0])}${bucket.dates.at(-1) ? ` - ${formatShortDate(bucket.dates.at(-1) as string)}` : ""})`
+        : bucket.label;
+      setMatrixCell(rows, 0, leadingColumnCount + bucketIndex, label);
+    });
+  }
+
+  let currentBodyRow = bodyStartRow;
+
+  parsedGroups.forEach((group, groupIndex) => {
+    for (let rowIndex = 0; rowIndex < group.rowCount; rowIndex += 1) {
+      let exportColumn = 0;
+
+      if (showNumber) {
+        if (rowIndex === 0) {
+          setMatrixCell(rows, currentBodyRow, exportColumn, groupIndex + 1);
+          if (group.rowCount > 1) {
+            merges.push({
+              s: { r: currentBodyRow, c: exportColumn },
+              e: { r: currentBodyRow + group.rowCount - 1, c: exportColumn },
+            });
+          }
+        }
+        exportColumn += 1;
+      }
+
+      visibleColumnIndexes.forEach((columnIndex) => {
+        const cell = group.cells[columnIndex];
+        const headerName = parsedTable.headers[columnIndex] || `Kolom ${columnIndex + 1}`;
+        const isStatusHeader = normalizeColumnName(headerName) === "status";
+        const cellKey = `${group.id}:${columnIndex}`;
+        const autoMergeRowSpan = autoMergeMap.rowSpanMap.get(cellKey);
+        const isCoveredByAutoMerge = autoMergeMap.coveredMap.has(cellKey);
+
+        if (isCoveredByAutoMerge) {
+          exportColumn += 1;
+          return;
+        }
+
+        if (!cell) {
+          exportColumn += 1;
+          return;
+        }
+
+        if ((cell.mergeDown || cell.mergeAuto) && rowIndex > 0) {
+          exportColumn += 1;
+          return;
+        }
+
+        const hasMultipleItems = cell.items.length > 1;
+        const statusValue = findStatusValue(group, parsedTable.headers);
+        const shouldRepeatStatus = isStatusHeader && Boolean(group.statusTargetColumn);
+        const value = shouldRepeatStatus
+          ? statusValue
+          : hasMultipleItems
+            ? cell.items[rowIndex] ?? ""
+            : rowIndex === 0
+              ? cell.value
+              : "";
+
+        setMatrixCell(rows, currentBodyRow, exportColumn, value || "");
+
+        const rowSpan = autoMergeRowSpan ?? (cell.mergeDown ? group.rowCount : 1);
+        if (rowSpan > 1) {
+          merges.push({
+            s: { r: currentBodyRow, c: exportColumn },
+            e: { r: currentBodyRow + rowSpan - 1, c: exportColumn },
+          });
+        }
+
+        exportColumn += 1;
+      });
+
+      if (timelineViewMode === "day") {
+        timelineDates.forEach((date, dateIndex) => {
+          const isActive = timelineAssignments.get(group.id)?.has(date) ?? false;
+          const isStartCell = group.startIndex !== null ? group.startIndex - 1 === dateIndex : false;
+          const isManual = group.manualIndices.includes(dateIndex + 1);
+          setMatrixCell(rows, currentBodyRow, exportColumn + dateIndex, isActive || isStartCell || isManual ? " " : "");
+        });
+      } else {
+        weekBuckets.forEach((bucket, bucketIndex) => {
+          const activeCount = bucket.dates.filter((date) => timelineAssignments.get(group.id)?.has(date)).length;
+          setMatrixCell(rows, currentBodyRow, exportColumn + bucketIndex, activeCount > 0 ? " " : "");
+        });
+      }
+
+      currentBodyRow += 1;
+    }
+  });
+
+  return { rows, merges, cols, bodyStartRow, leadingColumnCount, weekBuckets, monthBuckets };
+}
+
+function getExcelStatusFill(statusValue: string, theme: ExcelExportTheme) {
+  const normalized = statusValue.toLowerCase();
+
+  if (normalized.includes("done") || normalized.includes("selesai")) {
+    return theme === "light" ? "DCFCE7" : "D1FAE5";
+  }
+
+  if (normalized.includes("progress")) {
+    return theme === "light" ? "DBEAFE" : "DBEAFE";
+  }
+
+  if (normalized.includes("hold")) {
+    return theme === "light" ? "FEF3C7" : "FEF3C7";
+  }
+
+  if (normalized.includes("remove") || normalized.includes("cancel") || normalized.includes("ga jadi")) {
+    return theme === "light" ? "FEE2E2" : "FEE2E2";
+  }
+
+  return theme === "light" ? "E5E7EB" : "E2E8F0";
+}
+
+function getExcelTimelineFill(
+  timelineStatus: string | null,
+  statusValue: string,
+  theme: ExcelExportTheme
+) {
+  const normalized = (timelineStatus || statusValue || "backlog").toLowerCase();
+
+  if (normalized.includes("done") || normalized.includes("selesai")) {
+    return theme === "light" ? "22C55E" : "10B981";
+  }
+
+  if (normalized.includes("hold")) {
+    return theme === "light" ? "F59E0B" : "F59E0B";
+  }
+
+  if (normalized.includes("remove") || normalized.includes("cancel") || normalized.includes("ga jadi")) {
+    return theme === "light" ? "EF4444" : "EF4444";
+  }
+
+  if (
+    normalized.includes("backlog") ||
+    normalized.includes("todo") ||
+    normalized.includes("plan") ||
+    normalized.includes("belum") ||
+    normalized.includes("not started")
+  ) {
+    return theme === "light" ? "94A3B8" : "64748B";
+  }
+
+  return theme === "light" ? "3B82F6" : "3B82F6";
+}
+
+function normalizeExportStatus(value: string | null | undefined) {
+  const normalized = (value || "").trim().toLowerCase();
+
+  if (
+    normalized.includes("backlog") ||
+    normalized.includes("todo") ||
+    normalized.includes("plan") ||
+    normalized.includes("belum") ||
+    normalized.includes("not started")
+  ) {
+    return "backlog";
+  }
+
+  if (normalized.includes("progress")) {
+    return "progress";
+  }
+
+  if (normalized.includes("done") || normalized.includes("selesai")) {
+    return "done";
+  }
+
+  if (normalized.includes("hold")) {
+    return "on hold";
+  }
+
+  if (normalized.includes("remove") || normalized.includes("cancel") || normalized.includes("ga jadi")) {
+    return "remove";
+  }
+
+  return "other";
+}
+
+function buildExportStatusSummary(groups: ParsedGroup[], headers: string[]) {
+  const summary = {
+    backlog: 0,
+    progress: 0,
+    done: 0,
+    "on hold": 0,
+    remove: 0,
+    other: 0,
+  };
+
+  groups.forEach((group) => {
+    const statusKey = normalizeExportStatus(group.timelineStatus || findStatusValue(group, headers) || "backlog");
+    summary[statusKey] += 1;
+  });
+
+  return summary;
 }
 
 function statusTone(value: string) {
@@ -766,6 +1120,7 @@ export default function TimelinePlanner() {
   const [tableCellPaddingX, setTableCellPaddingX] = useState("12");
   const [tableCellPaddingY, setTableCellPaddingY] = useState("8");
   const [showNumber, setShowNumber] = useState(true);
+  const [excelExportTheme, setExcelExportTheme] = useState<ExcelExportTheme>("dark");
   const [rawInput, setRawInput] = useState(initialRawInput);
   const [submittedInput, setSubmittedInput] = useState(initialRawInput);
   const [manualDragState, setManualDragState] = useState<ManualDragState | null>(null);
@@ -774,16 +1129,13 @@ export default function TimelinePlanner() {
   const [openHiddenColumnsMenu, setOpenHiddenColumnsMenu] = useState(false);
   const [hiddenColumnIndexes, setHiddenColumnIndexes] = useState<number[]>([]);
   const [columnAlignments, setColumnAlignments] = useState<Record<string, ColumnVerticalAlign>>({});
+  const [columnValueModes, setColumnValueModes] = useState<Record<string, ColumnValueDisplayMode>>({});
   const [editingHeader, setEditingHeader] = useState<EditingHeaderState | null>(null);
   const [editingHeaderDraft, setEditingHeaderDraft] = useState("");
-  const [isParserDialogOpen, setIsParserDialogOpen] = useState(false);
-  const [isTimelineSettingsOpen, setIsTimelineSettingsOpen] = useState(false);
-  const [isRawInputOpen, setIsRawInputOpen] = useState(false);
-  const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
-  const [importDraft, setImportDraft] = useState("");
   const [importError, setImportError] = useState("");
   const manualDragVisitedRef = useRef<Set<string>>(new Set());
   const manualDragStateRef = useRef<ManualDragState | null>(null);
+  const importFileInputRef = useRef<HTMLInputElement | null>(null);
   const deferredSubmittedInput = useDeferredValue(submittedInput);
 
   const parsedTimelineStart = parseDateParts(timelineStartParts);
@@ -830,6 +1182,7 @@ export default function TimelinePlanner() {
   const dayFontSizePx = Math.max(8, fontSizePx - 1);
   const timelineCellMinWidthPx = Math.max(24, fontSizePx * 3);
   const timelineCellMinHeightPx = Math.max(16, fontSizePx + paddingYPx);
+  const stickySecondHeaderTopPx = Math.max(38, fontSizePx + paddingYPx + 14);
   const dataCellStyle = { padding: `${paddingYPx}px ${paddingXPx}px` };
   const timelineCellStyle = {
     padding: `${Math.max(0, Math.round(paddingYPx / 2))}px ${Math.max(0, Math.round(paddingXPx / 4))}px`,
@@ -866,6 +1219,7 @@ export default function TimelinePlanner() {
       tableCellPaddingY,
       hiddenColumnIndexes,
       columnAlignments,
+      columnValueModes,
       showNumber,
       rawInput,
     };
@@ -882,6 +1236,7 @@ export default function TimelinePlanner() {
     setTableCellPaddingY(snapshot.tableCellPaddingY ?? "8");
     setHiddenColumnIndexes(snapshot.hiddenColumnIndexes ?? []);
     setColumnAlignments(snapshot.columnAlignments ?? {});
+    setColumnValueModes(snapshot.columnValueModes ?? snapshot.columnHeaderModes ?? {});
     setShowNumber(snapshot.showNumber);
     const normalizedRawInput = normalizeRawInputStructure(snapshot.rawInput);
     setRawInput(normalizedRawInput);
@@ -903,9 +1258,306 @@ export default function TimelinePlanner() {
     URL.revokeObjectURL(url);
   }
 
-  function handleImportJson() {
+  async function handleExportExcel() {
     try {
-      const parsed = JSON.parse(importDraft) as Partial<TimelinePlannerSnapshot>;
+      const ExcelJS = await import("exceljs");
+      const isLightTheme = excelExportTheme === "light";
+      const preludeRowCount = 8;
+      const statusSummary = buildExportStatusSummary(parsedGroups, parsedTable.headers);
+      const legendItems = [
+        { label: "Backlog / Plan", color: getExcelTimelineFill("backlog", "backlog", excelExportTheme) },
+        { label: "In Progress", color: getExcelTimelineFill("progress", "progress", excelExportTheme) },
+        { label: "Done", color: getExcelTimelineFill("done", "done", excelExportTheme) },
+        { label: "On Hold", color: getExcelTimelineFill("hold", "hold", excelExportTheme) },
+        { label: "Remove / Cancel", color: getExcelTimelineFill("remove", "remove", excelExportTheme) },
+      ];
+      const { rows, merges, cols, bodyStartRow, leadingColumnCount, weekBuckets } = buildExcelExportModel({
+        showNumber,
+        visibleColumnIndexes,
+        parsedTable,
+        parsedGroups,
+        columnValueModes,
+        timelineViewMode,
+        timelineDates,
+        timelineAssignments,
+        autoMergeMap,
+        timelineCellMinWidthPx,
+      });
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet("Timeline", {
+        views: [{ state: "frozen", xSplit: leadingColumnCount, ySplit: bodyStartRow + preludeRowCount }],
+      });
+      const thinBorder = {
+        top: { style: "thin" as const, color: { argb: isLightTheme ? "CBD5E1" : "334155" } },
+        left: { style: "thin" as const, color: { argb: isLightTheme ? "CBD5E1" : "334155" } },
+        bottom: { style: "thin" as const, color: { argb: isLightTheme ? "CBD5E1" : "334155" } },
+        right: { style: "thin" as const, color: { argb: isLightTheme ? "CBD5E1" : "334155" } },
+      };
+      const baseTextColor = isLightTheme ? "0F172A" : "E2E8F0";
+      const titleFill = isLightTheme ? "E2E8F0" : "0F172A";
+      const panelFill = isLightTheme ? "F8FAFC" : "111827";
+
+      worksheet.getCell("A1").value = "Timeline Planner Export";
+      worksheet.getCell("A1").font = { name: "Calibri", size: 14, bold: true, color: { argb: baseTextColor } };
+      worksheet.getCell("A1").fill = { type: "pattern", pattern: "solid", fgColor: { argb: titleFill } };
+      worksheet.getCell("A1").border = thinBorder;
+      worksheet.mergeCells("A1:F1");
+
+      worksheet.getCell("A2").value = "Legend Warna Timeline";
+      worksheet.getCell("A2").font = { name: "Calibri", size: 11, bold: true, color: { argb: baseTextColor } };
+
+      legendItems.forEach((item, index) => {
+        const rowNumber = 3 + index;
+        const colorCell = worksheet.getCell(`A${rowNumber}`);
+        const labelCell = worksheet.getCell(`B${rowNumber}`);
+        colorCell.value = " ";
+        colorCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: item.color } };
+        colorCell.border = thinBorder;
+        labelCell.value = item.label;
+        labelCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: panelFill } };
+        labelCell.border = thinBorder;
+        labelCell.font = { name: "Calibri", size: 10, color: { argb: baseTextColor } };
+      });
+
+      worksheet.getCell("D2").value = "Ringkasan Status";
+      worksheet.getCell("D2").font = { name: "Calibri", size: 11, bold: true, color: { argb: baseTextColor } };
+
+      [
+        ["Backlog", statusSummary.backlog],
+        ["Progress", statusSummary.progress],
+        ["Done", statusSummary.done],
+        ["On Hold", statusSummary["on hold"]],
+        ["Remove", statusSummary.remove],
+        ["Other", statusSummary.other],
+      ].forEach(([label, value], index) => {
+        const rowNumber = 3 + index;
+        const labelCell = worksheet.getCell(`D${rowNumber}`);
+        const valueCell = worksheet.getCell(`E${rowNumber}`);
+        labelCell.value = label;
+        valueCell.value = Number(value);
+        labelCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: panelFill } };
+        valueCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: panelFill } };
+        labelCell.border = thinBorder;
+        valueCell.border = thinBorder;
+        labelCell.font = { name: "Calibri", size: 10, color: { argb: baseTextColor } };
+        valueCell.font = { name: "Calibri", size: 10, bold: true, color: { argb: baseTextColor } };
+        valueCell.alignment = { vertical: "middle", horizontal: "center" };
+      });
+
+      rows.forEach((row) => worksheet.addRow(row));
+
+      cols.forEach((col, index) => {
+        worksheet.getColumn(index + 1).width = Math.max(8, Math.round(col.wpx / 7));
+      });
+
+      merges.forEach((merge) => {
+        worksheet.mergeCells(
+          merge.s.r + 1 + preludeRowCount,
+          merge.s.c + 1,
+          merge.e.r + 1 + preludeRowCount,
+          merge.e.c + 1
+        );
+      });
+
+      worksheet.eachRow((row, rowNumber) => {
+        row.height = rowNumber <= preludeRowCount ? 22 : rowNumber <= bodyStartRow + preludeRowCount ? 24 : 22;
+
+        row.eachCell({ includeEmpty: true }, (cell, columnNumber) => {
+          cell.border = thinBorder;
+          cell.font = { name: "Calibri", size: rowNumber <= bodyStartRow ? 11 : 10 };
+          cell.alignment = {
+            vertical: "middle",
+            horizontal: columnNumber > leadingColumnCount ? "center" : "left",
+            wrapText: true,
+          };
+
+          if (rowNumber > preludeRowCount && rowNumber <= bodyStartRow + preludeRowCount) {
+            cell.fill = {
+              type: "pattern",
+              pattern: "solid",
+              fgColor: { argb: isLightTheme ? (rowNumber === 1 ? "E2E8F0" : "F8FAFC") : rowNumber === 1 ? "0F172A" : "1E293B" },
+            };
+            cell.font = {
+              name: "Calibri",
+              size: rowNumber === 1 ? 11 : 10,
+              bold: true,
+              color: { argb: isLightTheme ? "0F172A" : "F8FAFC" },
+            };
+            cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+          }
+        });
+      });
+
+      let currentBodyRow = bodyStartRow + 1;
+      parsedGroups.forEach((group, groupIndex) => {
+        for (let rowIndex = 0; rowIndex < group.rowCount; rowIndex += 1) {
+          const excelRowNumber = currentBodyRow + preludeRowCount;
+          let exportColumn = 1;
+
+          if (showNumber) {
+            const numberCell = worksheet.getCell(excelRowNumber, exportColumn);
+            numberCell.alignment = { vertical: "middle", horizontal: "center" };
+            exportColumn += 1;
+          }
+
+          visibleColumnIndexes.forEach((columnIndex) => {
+            const cell = group.cells[columnIndex];
+            const headerName = parsedTable.headers[columnIndex] || `Kolom ${columnIndex + 1}`;
+            const isStatusHeader = normalizeColumnName(headerName) === "status";
+            const columnValueMode = columnValueModes[String(columnIndex)] ?? "horizontal";
+            const cellKey = `${group.id}:${columnIndex}`;
+            const autoMergeRowSpan = autoMergeMap.rowSpanMap.get(cellKey);
+            const isCoveredByAutoMerge = autoMergeMap.coveredMap.has(cellKey);
+            const excelCell = worksheet.getCell(excelRowNumber, exportColumn);
+
+            if (isCoveredByAutoMerge || !cell || ((cell.mergeDown || cell.mergeAuto) && rowIndex > 0)) {
+              exportColumn += 1;
+              return;
+            }
+
+            const hasMultipleItems = cell.items.length > 1;
+            const statusValue = findStatusValue(group, parsedTable.headers);
+            const shouldRepeatStatus = isStatusHeader && Boolean(group.statusTargetColumn);
+            const value = shouldRepeatStatus
+              ? statusValue
+              : hasMultipleItems
+                ? cell.items[rowIndex] ?? ""
+                : rowIndex === 0
+                  ? cell.value
+                  : "";
+
+            if (isStatusHeader && value) {
+              excelCell.fill = {
+                type: "pattern",
+                pattern: "solid",
+                fgColor: { argb: getExcelStatusFill(value, excelExportTheme) },
+              };
+              excelCell.font = { name: "Calibri", size: 10, bold: true, color: { argb: "0F172A" } };
+              excelCell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+            } else if ((columnValueModes[String(columnIndex)] ?? "horizontal") === "vertical" && value) {
+              excelCell.alignment = {
+                vertical: "middle",
+                horizontal: "center",
+                textRotation: 90,
+                wrapText: false,
+              };
+            } else {
+              excelCell.alignment = {
+                vertical: "middle",
+                horizontal: columnValueMode === "vertical" ? "center" : "left",
+                wrapText: true,
+              };
+            }
+
+            if (autoMergeRowSpan || cell.mergeDown) {
+              const mergeRowSpan = autoMergeRowSpan ?? group.rowCount;
+              for (let mergeOffset = 1; mergeOffset < mergeRowSpan; mergeOffset += 1) {
+                const mergedCell = worksheet.getCell(excelRowNumber + mergeOffset, exportColumn);
+                mergedCell.border = thinBorder;
+              }
+            }
+
+            exportColumn += 1;
+          });
+
+          if (timelineViewMode === "day") {
+            timelineDates.forEach((date, dateIndex) => {
+              const timelineCell = worksheet.getCell(excelRowNumber, exportColumn + dateIndex);
+              const statusValue = findStatusValue(group, parsedTable.headers);
+              const isActive = timelineAssignments.get(group.id)?.has(date) ?? false;
+              const isStartCell = group.startIndex !== null ? group.startIndex - 1 === dateIndex : false;
+              const isManual = group.manualIndices.includes(dateIndex + 1);
+
+              if (isActive || isStartCell || isManual) {
+                timelineCell.fill = {
+                  type: "pattern",
+                  pattern: "solid",
+                  fgColor: { argb: getExcelTimelineFill(group.timelineStatus, statusValue, excelExportTheme) },
+                };
+                timelineCell.font = {
+                  name: "Calibri",
+                  size: 10,
+                  bold: true,
+                  color: { argb: isLightTheme ? "0F172A" : "F8FAFC" },
+                };
+                timelineCell.alignment = { vertical: "middle", horizontal: "center" };
+              }
+            });
+          } else {
+            weekBuckets.forEach((bucket, bucketIndex) => {
+              const timelineCell = worksheet.getCell(excelRowNumber, exportColumn + bucketIndex);
+              const activeDates = bucket.dates.filter((date) => timelineAssignments.get(group.id)?.has(date));
+              const statusValue = findStatusValue(group, parsedTable.headers);
+
+              if (activeDates.length > 0) {
+                timelineCell.fill = {
+                  type: "pattern",
+                  pattern: "solid",
+                  fgColor: { argb: getExcelTimelineFill(group.timelineStatus, statusValue, excelExportTheme) },
+                };
+                timelineCell.font = {
+                  name: "Calibri",
+                  size: 10,
+                  bold: true,
+                  color: { argb: isLightTheme ? "0F172A" : "F8FAFC" },
+                };
+                timelineCell.alignment = { vertical: "middle", horizontal: "center" };
+              }
+            });
+          }
+
+          currentBodyRow += 1;
+        }
+
+        const endRow = currentBodyRow - 1;
+        for (let rowPointer = currentBodyRow - group.rowCount + preludeRowCount; rowPointer <= endRow + preludeRowCount; rowPointer += 1) {
+          const tone = isLightTheme
+            ? groupIndex % 2 === 0
+              ? "FFFFFF"
+              : "F8FAFC"
+            : groupIndex % 2 === 0
+              ? "020617"
+              : "0F172A";
+          for (let columnPointer = 1; columnPointer <= cols.length; columnPointer += 1) {
+            const cell = worksheet.getCell(rowPointer, columnPointer);
+            if (!cell.fill) {
+              cell.fill = {
+                type: "pattern",
+                pattern: "solid",
+                fgColor: { argb: tone },
+              };
+            }
+            if (!cell.font || !("color" in cell.font) || !cell.font.color) {
+              cell.font = {
+                ...(cell.font ?? {}),
+                name: "Calibri",
+                size: 10,
+                color: { argb: isLightTheme ? "0F172A" : "E2E8F0" },
+              };
+            }
+          }
+        }
+      });
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buffer], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "timeline-planner-export.xlsx";
+      anchor.click();
+      URL.revokeObjectURL(url);
+      setImportError("");
+    } catch {
+      setImportError("Export Excel gagal diproses.");
+    }
+  }
+
+  function importSnapshotFromText(text: string) {
+    try {
+      const parsed = JSON.parse(text) as Partial<TimelinePlannerSnapshot>;
 
       if (
         parsed.version !== 1 ||
@@ -921,6 +1573,10 @@ export default function TimelinePlanner() {
           !Array.isArray(parsed.hiddenColumnIndexes)) ||
         (parsed.columnAlignments !== undefined &&
           (typeof parsed.columnAlignments !== "object" || parsed.columnAlignments === null)) ||
+        (parsed.columnValueModes !== undefined &&
+          (typeof parsed.columnValueModes !== "object" || parsed.columnValueModes === null)) ||
+        (parsed.columnHeaderModes !== undefined &&
+          (typeof parsed.columnHeaderModes !== "object" || parsed.columnHeaderModes === null)) ||
         typeof parsed.showNumber !== "boolean" ||
         typeof parsed.rawInput !== "string"
       ) {
@@ -940,15 +1596,24 @@ export default function TimelinePlanner() {
         tableCellPaddingY: parsed.tableCellPaddingY,
         hiddenColumnIndexes: parsed.hiddenColumnIndexes?.filter((value) => Number.isInteger(value)),
         columnAlignments: parsed.columnAlignments as Record<string, ColumnVerticalAlign> | undefined,
+        columnValueModes:
+          (parsed.columnValueModes ?? parsed.columnHeaderModes) as
+            | Record<string, ColumnValueDisplayMode>
+            | undefined,
         showNumber: parsed.showNumber,
         rawInput: parsed.rawInput,
       });
       setImportError("");
-      setImportDraft("");
-      setIsImportDialogOpen(false);
+      return true;
     } catch {
       setImportError("JSON tidak bisa dibaca. Cek lagi formatnya.");
+      return false;
     }
+  }
+
+  function handleImportButtonClick() {
+    setImportError("");
+    importFileInputRef.current?.click();
   }
 
   function handleImportFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -960,8 +1625,7 @@ export default function TimelinePlanner() {
 
     file.text()
       .then((text) => {
-        setImportDraft(text);
-        setImportError("");
+        importSnapshotFromText(text);
       })
       .catch(() => {
         setImportError("File JSON tidak bisa dibaca.");
@@ -1154,6 +1818,8 @@ export default function TimelinePlanner() {
         .filter((index) => index !== columnIndex)
         .map((index) => (index > columnIndex ? index - 1 : index))
     );
+    setColumnAlignments((current) => shiftIndexedRecord(current, columnIndex));
+    setColumnValueModes((current) => shiftIndexedRecord(current, columnIndex));
     startTransition(() => {
       setSubmittedInput(nextRawInput);
     });
@@ -1173,6 +1839,14 @@ export default function TimelinePlanner() {
     setColumnAlignments((current) => ({
       ...current,
       [String(columnIndex)]: alignment,
+    }));
+    setOpenHeaderActionIndex(null);
+  }
+
+  function handleSetColumnValueMode(columnIndex: number, mode: ColumnValueDisplayMode) {
+    setColumnValueModes((current) => ({
+      ...current,
+      [String(columnIndex)]: mode,
     }));
     setOpenHeaderActionIndex(null);
   }
@@ -1201,28 +1875,207 @@ export default function TimelinePlanner() {
             Raw Task Builder
           </div>
           <div className="flex flex-wrap gap-3 md:justify-end">
+            <AppModal
+              title="Timeline Global"
+              description="Atur tanggal mulai, durasi, view timeline, dan opsi global lainnya."
+              trigger={
+                <Button
+                  variant="outline"
+                  className="gap-2 border-white/10 bg-slate-950/80 text-slate-100 hover:bg-slate-900 hover:text-white dark:border-white/10 dark:bg-slate-950/80 dark:hover:bg-slate-900"
+                >
+                  <CalendarRange className="size-4" />
+                  Timeline global
+                </Button>
+              }
+            >
+              <div className="grid gap-4">
+                <div className="grid gap-1.5 text-sm">
+                  <span className="text-slate-300">Tanggal mulai</span>
+                  <div className="grid grid-cols-[72px_72px_1fr] gap-2">
+                    <Input
+                      inputMode="numeric"
+                      placeholder="03"
+                      value={timelineStartParts.day}
+                      onChange={(event) => handleTimelinePartChange("day", event.target.value)}
+                      className="border-slate-700 bg-slate-900 text-center text-white"
+                    />
+                    <Input
+                      inputMode="numeric"
+                      placeholder="06"
+                      value={timelineStartParts.month}
+                      onChange={(event) => handleTimelinePartChange("month", event.target.value)}
+                      className="border-slate-700 bg-slate-900 text-center text-white"
+                    />
+                    <Input
+                      inputMode="numeric"
+                      placeholder="2026"
+                      value={timelineStartParts.year}
+                      onChange={(event) => handleTimelinePartChange("year", event.target.value)}
+                      className="border-slate-700 bg-slate-900 text-center text-white"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid gap-1.5 text-sm">
+                  <span className="text-slate-300">Progress harian</span>
+                  <div className="grid grid-cols-[96px_1fr] gap-2">
+                    <Input
+                      inputMode="numeric"
+                      value={timelineTargetAmount}
+                      onChange={(event) =>
+                        setTimelineTargetAmount(event.target.value.replace(/\D/g, "").slice(0, 3))
+                      }
+                      className="border-slate-700 bg-slate-900 text-center text-white"
+                    />
+                    <div className="flex h-9 items-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-slate-200">
+                      hari
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid gap-1.5 text-sm">
+                  <span className="text-slate-300">Kolom acuan task</span>
+                  <select
+                    value={timelineTargetColumn}
+                    onChange={(event) => setTimelineTargetColumn(event.target.value)}
+                    className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                  >
+                    {parsedTable.headers.map((header) => (
+                      <option key={header} value={header}>
+                        {header}
+                      </option>
+                    ))}
+                  </select>
+                  {parsedTable.timelineHeader ? (
+                    <p className="text-xs text-slate-400">
+                      Header `;timeline` aktif: timeline otomatis mengacu ke `{parsedTable.timelineHeader}`.
+                    </p>
+                  ) : null}
+                </div>
+
+                <div className="grid gap-1.5 text-sm">
+                  <span className="text-slate-300">Per task berapa hari</span>
+                  <select
+                    value={timelineTaskDays}
+                    onChange={(event) => setTimelineTaskDays(event.target.value)}
+                    className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                  >
+                    {Array.from({ length: 14 }).map((_, index) => {
+                      const value = String(index + 1);
+                      return (
+                        <option key={value} value={value}>
+                          {value} hari
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+
+                <div className="grid gap-1.5 text-sm">
+                  <span className="text-slate-300">View timeline</span>
+                  <select
+                    value={timelineViewMode}
+                    onChange={(event) => setTimelineViewMode(event.target.value as TimelineViewMode)}
+                    className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                  >
+                    <option value="day">Daily</option>
+                    <option value="week">Weekly</option>
+                  </select>
+                </div>
+
+                {parsedTimelineStart ? (
+                  <div className="grid gap-1 rounded-xl border border-white/10 bg-slate-900/70 p-4 text-sm text-slate-300">
+                    <p>
+                      Range otomatis: <span className="font-semibold text-white">{formatLongDate(timelineStart)}</span>{" "}
+                      sampai <span className="font-semibold text-white">{formatLongDate(timelineEnd)}</span>
+                    </p>
+                    <p>
+                      Render awal pakai <span className="font-semibold text-white">{timelineDates.length} hari</span>.
+                    </p>
+                    <p>
+                      Mode aktif: <span className="font-semibold text-white">{timelineViewMode === "day" ? "Daily" : "Weekly"}</span>
+                    </p>
+                    <p>
+                      Font table: <span className="font-semibold text-white">{tableFontSize}px</span>
+                    </p>
+                    <p>
+                      Padding value: <span className="font-semibold text-white">{tableCellPaddingX}px x {tableCellPaddingY}px</span>
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-sm text-amber-300">
+                    Isi tanggal mulai valid dulu supaya target timeline bisa dihitung otomatis.
+                  </p>
+                )}
+              </div>
+            </AppModal>
+            <AppModal
+              title="Input Mentah"
+              description="Edit raw input penuh di sini, lalu render ulang untuk melihat hasil table terbaru."
+              dialogClassName="h-[92vh] max-w-[calc(100%-2rem)] sm:max-w-6xl"
+              contentClassName="flex-1"
+              trigger={
+                <Button
+                  variant="outline"
+                  className="gap-2 border-white/10 bg-slate-950/80 text-slate-100 hover:bg-slate-900 hover:text-white dark:border-white/10 dark:bg-slate-950/80 dark:hover:bg-slate-900"
+                >
+                  <TableProperties className="size-4" />
+                  Input mentah
+                </Button>
+              }
+              footer={
+                <>
+                  <DialogClose asChild>
+                    <Button variant="outline">Tutup</Button>
+                  </DialogClose>
+                  <Button onClick={handleSubmitRawInput}>Render table</Button>
+                </>
+              }
+            >
+              <Textarea
+                value={rawInput}
+                onChange={(event) => setRawInput(event.target.value)}
+                className="min-h-full border-white/10 bg-slate-900 font-mono text-sm text-white"
+                placeholder="migrasiFunctionA;m | fileA,fileB,fileC,fileD | on progress | deskripsi"
+              />
+            </AppModal>
+            <AppModal
+              title="Aturan Parser"
+              description="Referensi cepat untuk format raw input dan interaksi timeline."
+              trigger={
+                <Button
+                  variant="outline"
+                  className="gap-2 border-white/10 bg-slate-950/80 text-slate-100 hover:bg-slate-900 hover:text-white dark:border-white/10 dark:bg-slate-950/80 dark:hover:bg-slate-900"
+                >
+                  Aturan parser
+                </Button>
+              }
+            >
+              <div className="grid gap-3 text-sm text-slate-300">
+                <div>baris pertama = nama kolom / header table</div>
+                <div>`|` = pindah ke kolom berikutnya</div>
+                <div>`,` = item banyak di dalam satu grup</div>
+                <div>`;m` = kolom sebelumnya di-merge vertikal mengikuti jumlah item dalam grup yang sama</div>
+                <div>`;ma` = merge auto ke bawah sampai ketemu value berikutnya di kolom yang sama</div>
+                <div>`;ma` juga bantu auto-koreksi baris pendek saat render, jadi kolom kosong akan disisipkan otomatis</div>
+                <div>`;status=NamaKolom` = status akan ditempel ke kolom header yang dipilih</div>
+                <div>`;timeline` di header = tandai kolom acuan timeline, contoh `Task;timeline`</div>
+                <div>`;start=Angka` = posisi mulai timeline hasil klik otomatis akan disimpan ke raw input</div>
+                <div>`;manual=2,5,9` = tambahan slot harian manual hasil `Shift+Click`</div>
+                <div>Export JSON = simpan seluruh setting dan raw input yang sudah disesuaikan</div>
+                <div>Import JSON = overwrite state aktif sesuai isi snapshot JSON</div>
+                <div>klik biasa = tidak mengubah timeline</div>
+                <div className="text-slate-400">`Ctrl+Click` = geser task, `Shift+Click` = tambah/hapus hari manual</div>
+                <div className="text-slate-400">tahan `Shift` lalu drag = isi beberapa slot manual sekaligus</div>
+              </div>
+            </AppModal>
             <Button
               variant="outline"
               className="gap-2 border-white/10 bg-slate-950/80 text-slate-100 hover:bg-slate-900 hover:text-white dark:border-white/10 dark:bg-slate-950/80 dark:hover:bg-slate-900"
-              onClick={() => setIsTimelineSettingsOpen(true)}
+              onClick={handleExportExcel}
             >
-              <CalendarRange className="size-4" />
-              Timeline global
-            </Button>
-            <Button
-              variant="outline"
-              className="gap-2 border-white/10 bg-slate-950/80 text-slate-100 hover:bg-slate-900 hover:text-white dark:border-white/10 dark:bg-slate-950/80 dark:hover:bg-slate-900"
-              onClick={() => setIsRawInputOpen(true)}
-            >
-              <TableProperties className="size-4" />
-              Input mentah
-            </Button>
-            <Button
-              variant="outline"
-              className="gap-2 border-white/10 bg-slate-950/80 text-slate-100 hover:bg-slate-900 hover:text-white dark:border-white/10 dark:bg-slate-950/80 dark:hover:bg-slate-900"
-              onClick={() => setIsParserDialogOpen(true)}
-            >
-              Aturan parser
+              <Download className="size-4" />
+              Export Excel
             </Button>
             <Button
               variant="outline"
@@ -1235,28 +2088,26 @@ export default function TimelinePlanner() {
             <Button
               variant="outline"
               className="gap-2 border-white/10 bg-slate-950/80 text-slate-100 hover:bg-slate-900 hover:text-white dark:border-white/10 dark:bg-slate-950/80 dark:hover:bg-slate-900"
-              onClick={() => {
-                setImportError("");
-                setImportDraft("");
-                setIsImportDialogOpen(true);
-              }}
+              onClick={handleImportButtonClick}
             >
               <Download className="size-4" />
               Import JSON
             </Button>
+            <Input
+              ref={importFileInputRef}
+              type="file"
+              accept=".json,application/json"
+              onChange={handleImportFileChange}
+              className="hidden"
+            />
           </div>
+          {importError ? <div className="text-sm text-rose-300">{importError}</div> : null}
         </div>
         <div className="rounded-2xl border border-white/10 bg-slate-950/70 p-4 shadow-[0_18px_40px_rgba(2,6,23,0.18)]">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-            <div className="max-w-md">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between pb-10 px-4 ">
+            <div className="max-w-md ">
               <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-300">
                 Table Toolbar
-              </div>
-              <div className="mt-1 text-sm font-medium text-white">
-                Kontrol tampilan tabel
-              </div>
-              <div className="mt-1 text-xs leading-5 text-slate-400">
-                Atur kolom tersembunyi, nomor baris, ukuran font, dan padding value dari satu area yang rapi.
               </div>
             </div>
             <div className="flex flex-wrap items-end gap-3">
@@ -1309,6 +2160,17 @@ export default function TimelinePlanner() {
                   className="size-4 rounded border-slate-500 bg-slate-950"
                 />
                 <span>Show number</span>
+              </label>
+              <label className="grid gap-1.5 text-xs text-slate-300">
+                <span className="px-1 uppercase tracking-[0.14em] text-slate-500">Excel Theme</span>
+                <select
+                  value={excelExportTheme}
+                  onChange={(event) => setExcelExportTheme(event.target.value as ExcelExportTheme)}
+                  className="h-10 rounded-xl border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition hover:border-slate-500 focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                >
+                  <option value="dark">Dark</option>
+                  <option value="light">Light</option>
+                </select>
               </label>
               <label className="grid gap-1.5 text-xs text-slate-300">
                 <span className="px-1 uppercase tracking-[0.14em] text-slate-500">Font Size</span>
@@ -1369,7 +2231,7 @@ export default function TimelinePlanner() {
 
 
 
-                <div className="overflow-x-auto">
+                <div className="max-h-[72vh] overflow-auto">
                   <div className="inline-block w-max rounded-2xl border border-white/10 bg-slate-950/70 p-3 align-top">
                     {(() => {
                       const weekBuckets = createWeekBuckets(timelineDates);
@@ -1384,7 +2246,7 @@ export default function TimelinePlanner() {
                                     <th
                                       rowSpan={2}
                                       className={cn(
-                                        "w-16 bg-slate-900 border-b border-r border-white/10 px-4 py-2 text-center align-middle font-semibold"
+                                        "w-16 border-b border-r border-white/10 bg-slate-900 px-4 py-2 text-center align-middle font-semibold"
                                       )}
                                       style={{ fontSize: `${fontSizePx}px` }}
                                     >
@@ -1393,7 +2255,7 @@ export default function TimelinePlanner() {
                                   ) : null}
                                   <th
                                     rowSpan={2}
-                                    className="w-20 bg-slate-900 border-b border-r border-white/10 px-3 py-2 text-center align-middle font-semibold"
+                                    className="w-20 border-b border-r border-white/10 bg-slate-900 px-3 py-2 text-center align-middle font-semibold"
                                     style={{ fontSize: `${fontSizePx}px` }}
                                   >
                                     Action
@@ -1403,7 +2265,7 @@ export default function TimelinePlanner() {
                                       key={`header-${index}`}
                                       rowSpan={2}
                                       className={cn(
-                                        "bg-slate-900 border-b border-r border-white/10 px-4 py-2 text-left font-semibold last:border-r-0"
+                                        "border-b border-r border-white/10 bg-slate-900 px-4 py-2 text-left font-semibold last:border-r-0"
                                       )}
                                       style={{ fontSize: `${fontSizePx}px` }}
                                     >
@@ -1457,6 +2319,28 @@ export default function TimelinePlanner() {
                                                     })}
                                                   </div>
                                                 </div>
+                                                <div className="group/header-mode relative">
+                                                  <div className="flex items-center justify-between gap-3 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900">
+                                                    <span>Value</span>
+                                                    <span className="text-slate-500">â€º</span>
+                                                  </div>
+                                                  <div className="invisible absolute top-0 left-full z-30 ml-1 grid min-w-36 overflow-hidden rounded-lg border border-white/10 bg-slate-950 opacity-0 shadow-2xl transition group-hover/header-mode:visible group-hover/header-mode:opacity-100">
+                                                    {(["horizontal", "vertical"] as ColumnValueDisplayMode[]).map((mode) => {
+                                                      const isActive = (columnValueModes[String(index)] ?? "horizontal") === mode;
+                                                      return (
+                                                        <button
+                                                          key={mode}
+                                                          type="button"
+                                                          onClick={() => handleSetColumnValueMode(index, mode)}
+                                                          className="flex items-center justify-between gap-3 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900"
+                                                        >
+                                                          <span>{mode === "vertical" ? "Vertikal" : "Horizontal"}</span>
+                                                          <span className={cn(isActive ? "text-emerald-300" : "text-transparent")}>âœ“</span>
+                                                        </button>
+                                                      );
+                                                    })}
+                                                  </div>
+                                                </div>
                                                 <button
                                                   type="button"
                                                   onClick={() => handleToggleHiddenColumn(index)}
@@ -1493,9 +2377,9 @@ export default function TimelinePlanner() {
                                       key={bucket.label}
                                       colSpan={bucket.dates.length}
                                       className={cn(
-                                        "bg-slate-900 border-b border-r border-white/10 px-2 py-2 text-center font-semibold uppercase tracking-[0.18em] text-slate-300 last:border-r-0"
+                                        "sticky z-20 border-b border-r border-white/10 bg-slate-900 px-2 py-2 text-center font-semibold uppercase tracking-[0.18em] text-slate-300 last:border-r-0"
                                       )}
-                                      style={{ fontSize: `${monthFontSizePx}px` }}
+                                      style={{ fontSize: `${monthFontSizePx}px`, top: 0 }}
                                     >
                                       {bucket.label}
                                     </th>
@@ -1507,9 +2391,9 @@ export default function TimelinePlanner() {
                                       key={date}
                                       title={`${formatWeekday(date)}, ${formatLongDate(date)}`}
                                       className={cn(
-                                        "bg-slate-900/95 border-b border-r border-white/10 text-center font-semibold last:border-r-0"
+                                        "sticky z-20 border-b border-r border-white/10 bg-slate-900/95 text-center font-semibold last:border-r-0"
                                       )}
-                                      style={{ ...timelineCellStyle, fontSize: `${dayFontSizePx}px` }}
+                                      style={{ ...timelineCellStyle, fontSize: `${dayFontSizePx}px`, top: stickySecondHeaderTopPx }}
                                     >
                                       {formatDayNumber(date)}
                                     </th>
@@ -1521,7 +2405,7 @@ export default function TimelinePlanner() {
                                 {showNumber ? (
                                   <th
                                     className={cn(
-                                      "w-16 bg-slate-900 border-b border-r border-white/10 px-4 py-2 text-center align-middle font-semibold"
+                                      "w-16 border-b border-r border-white/10 bg-slate-900 px-4 py-2 text-center align-middle font-semibold"
                                     )}
                                     style={{ fontSize: `${fontSizePx}px` }}
                                   >
@@ -1529,7 +2413,7 @@ export default function TimelinePlanner() {
                                   </th>
                                 ) : null}
                                 <th
-                                  className="w-20 bg-slate-900 border-b border-r border-white/10 px-3 py-2 text-center align-middle font-semibold"
+                                  className="w-20 border-b border-r border-white/10 bg-slate-900 px-3 py-2 text-center align-middle font-semibold"
                                   style={{ fontSize: `${fontSizePx}px` }}
                                 >
                                   Action
@@ -1538,7 +2422,7 @@ export default function TimelinePlanner() {
                                   <th
                                     key={`header-${index}`}
                                     className={cn(
-                                      "bg-slate-900 border-b border-r border-white/10 px-4 py-2 text-left font-semibold last:border-r-0"
+                                      "border-b border-r border-white/10 bg-slate-900 px-4 py-2 text-left font-semibold last:border-r-0"
                                     )}
                                     style={{ fontSize: `${fontSizePx}px` }}
                                   >
@@ -1592,6 +2476,28 @@ export default function TimelinePlanner() {
                                                   })}
                                                 </div>
                                               </div>
+                                              <div className="group/header-mode relative">
+                                                <div className="flex items-center justify-between gap-3 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900">
+                                                  <span>Value</span>
+                                                  <span className="text-slate-500">â€º</span>
+                                                </div>
+                                                <div className="invisible absolute top-0 left-full z-30 ml-1 grid min-w-36 overflow-hidden rounded-lg border border-white/10 bg-slate-950 opacity-0 shadow-2xl transition group-hover/header-mode:visible group-hover/header-mode:opacity-100">
+                                                  {(["horizontal", "vertical"] as ColumnValueDisplayMode[]).map((mode) => {
+                                                    const isActive = (columnValueModes[String(index)] ?? "horizontal") === mode;
+                                                    return (
+                                                      <button
+                                                        key={mode}
+                                                        type="button"
+                                                        onClick={() => handleSetColumnValueMode(index, mode)}
+                                                        className="flex items-center justify-between gap-3 px-3 py-2 text-left text-xs text-slate-200 transition hover:bg-slate-900"
+                                                      >
+                                                        <span>{mode === "vertical" ? "Vertikal" : "Horizontal"}</span>
+                                                        <span className={cn(isActive ? "text-emerald-300" : "text-transparent")}>âœ“</span>
+                                                      </button>
+                                                    );
+                                                  })}
+                                                </div>
+                                              </div>
                                               <button
                                                 type="button"
                                                 onClick={() => handleToggleHiddenColumn(index)}
@@ -1627,7 +2533,7 @@ export default function TimelinePlanner() {
                                   <th
                                     key={bucket.label}
                                     className={cn(
-                                      "min-w-24 bg-slate-900 border-b border-r border-white/10 px-2 py-2 text-center font-semibold last:border-r-0"
+                                      "sticky top-0 z-20 min-w-24 border-b border-r border-white/10 bg-slate-900 px-2 py-2 text-center font-semibold last:border-r-0"
                                     )}
                                     style={{ fontSize: `${dayFontSizePx}px` }}
                                   >
@@ -1734,6 +2640,7 @@ export default function TimelinePlanner() {
                                         const statusValue = findStatusValue(group, parsedTable.headers);
                                         const isStatusHeader = normalizeColumnName(headerName) === "status";
                                         const columnAlignment = columnAlignments[String(columnIndex)] ?? "top";
+                                        const columnValueMode = columnValueModes[String(columnIndex)] ?? "horizontal";
                                         const cellKey = `${group.id}:${columnIndex}`;
                                         const autoMergeRowSpan = autoMergeMap.rowSpanMap.get(cellKey);
                                         const isCoveredByAutoMerge = autoMergeMap.coveredMap.has(cellKey);
@@ -1772,6 +2679,10 @@ export default function TimelinePlanner() {
                                               : rowIndex === 0
                                                 ? cell.value
                                                 : "";
+                                          const shouldRenderVerticalValue =
+                                            columnValueMode === "vertical" &&
+                                            !isStatusHeader &&
+                                            Boolean(value);
 
                                           return (
                                             <td
@@ -1780,11 +2691,12 @@ export default function TimelinePlanner() {
                                                 autoMergeRowSpan ??
                                                 (cell.mergeDown ? group.rowCount : 1)
                                               }
-                                            className={cn(
-                                              "border-b border-r border-white/10 text-slate-200 last:border-r-0",
-                                              cell.mergeDown || cell.mergeAuto
-                                                ? columnAlignment === "bottom"
-                                                  ? "align-bottom text-center"
+                                              className={cn(
+                                                "border-b border-r border-white/10 text-slate-200 last:border-r-0",
+                                                shouldRenderVerticalValue && "w-[56px] text-center",
+                                                cell.mergeDown || cell.mergeAuto
+                                                  ? columnAlignment === "bottom"
+                                                    ? "align-bottom text-center"
                                                   : columnAlignment === "middle"
                                                     ? "align-middle text-center"
                                                     : "align-top text-center"
@@ -1807,6 +2719,18 @@ export default function TimelinePlanner() {
                                                   style={statusBadgeStyle}
                                                 >
                                                   {value || "-"}
+                                                </span>
+                                              ) : shouldRenderVerticalValue ? (
+                                                <span
+                                                  className="inline-flex items-center justify-center whitespace-nowrap text-center"
+                                                  style={{
+                                                    writingMode: "vertical-rl",
+                                                    transform: "rotate(180deg)",
+                                                    textOrientation: "mixed",
+                                                    lineHeight: 1.1,
+                                                  }}
+                                                >
+                                                  {value}
                                                 </span>
                                               ) : (
                                                 value || <span className="text-slate-600">-</span>
@@ -1919,167 +2843,6 @@ export default function TimelinePlanner() {
         </div>
 
         <AppModal
-          open={isTimelineSettingsOpen}
-          onOpenChange={setIsTimelineSettingsOpen}
-          title="Timeline Global"
-          description="Atur tanggal mulai, durasi, view timeline, dan opsi global lainnya."
-        >
-          <div className="grid gap-4">
-            <div className="grid gap-1.5 text-sm">
-              <span className="text-slate-300">Tanggal mulai</span>
-              <div className="grid grid-cols-[72px_72px_1fr] gap-2">
-                <Input
-                  inputMode="numeric"
-                  placeholder="03"
-                  value={timelineStartParts.day}
-                  onChange={(event) => handleTimelinePartChange("day", event.target.value)}
-                  className="border-slate-700 bg-slate-900 text-center text-white"
-                />
-                <Input
-                  inputMode="numeric"
-                  placeholder="06"
-                  value={timelineStartParts.month}
-                  onChange={(event) => handleTimelinePartChange("month", event.target.value)}
-                  className="border-slate-700 bg-slate-900 text-center text-white"
-                />
-                <Input
-                  inputMode="numeric"
-                  placeholder="2026"
-                  value={timelineStartParts.year}
-                  onChange={(event) => handleTimelinePartChange("year", event.target.value)}
-                  className="border-slate-700 bg-slate-900 text-center text-white"
-                />
-              </div>
-            </div>
-
-            <div className="grid gap-1.5 text-sm">
-              <span className="text-slate-300">Progress harian</span>
-              <div className="grid grid-cols-[96px_1fr] gap-2">
-                <Input
-                  inputMode="numeric"
-                  value={timelineTargetAmount}
-                  onChange={(event) =>
-                    setTimelineTargetAmount(event.target.value.replace(/\D/g, "").slice(0, 3))
-                  }
-                  className="border-slate-700 bg-slate-900 text-center text-white"
-                />
-                <div className="flex h-9 items-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-slate-200">
-                  hari
-                </div>
-              </div>
-            </div>
-
-            <div className="grid gap-1.5 text-sm">
-              <span className="text-slate-300">Kolom acuan task</span>
-              <select
-                value={timelineTargetColumn}
-                onChange={(event) => setTimelineTargetColumn(event.target.value)}
-                className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-              >
-                {parsedTable.headers.map((header) => (
-                  <option key={header} value={header}>
-                    {header}
-                  </option>
-                ))}
-              </select>
-              {parsedTable.timelineHeader ? (
-                <p className="text-xs text-slate-400">
-                  Header `;timeline` aktif: timeline otomatis mengacu ke `{parsedTable.timelineHeader}`.
-                </p>
-              ) : null}
-            </div>
-
-            <div className="grid gap-1.5 text-sm">
-              <span className="text-slate-300">Per task berapa hari</span>
-              <select
-                value={timelineTaskDays}
-                onChange={(event) => setTimelineTaskDays(event.target.value)}
-                className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-              >
-                {Array.from({ length: 14 }).map((_, index) => {
-                  const value = String(index + 1);
-                  return (
-                    <option key={value} value={value}>
-                      {value} hari
-                    </option>
-                  );
-                })}
-              </select>
-            </div>
-
-            <div className="grid gap-1.5 text-sm">
-              <span className="text-slate-300">View timeline</span>
-              <select
-                value={timelineViewMode}
-                onChange={(event) => setTimelineViewMode(event.target.value as TimelineViewMode)}
-                className="h-9 rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-              >
-                <option value="day">Daily</option>
-                <option value="week">Weekly</option>
-              </select>
-            </div>
-
-            {parsedTimelineStart ? (
-              <div className="grid gap-1 rounded-xl border border-white/10 bg-slate-900/70 p-4 text-sm text-slate-300">
-                <p>
-                  Range otomatis: <span className="font-semibold text-white">{formatLongDate(timelineStart)}</span>{" "}
-                  sampai <span className="font-semibold text-white">{formatLongDate(timelineEnd)}</span>
-                </p>
-                <p>
-                  Render awal pakai <span className="font-semibold text-white">{timelineDates.length} hari</span>.
-                </p>
-                <p>
-                  Mode aktif: <span className="font-semibold text-white">{timelineViewMode === "day" ? "Daily" : "Weekly"}</span>
-                </p>
-                <p>
-                  Font table:{" "}
-                  <span className="font-semibold text-white">
-                    {tableFontSize}px
-                  </span>
-                </p>
-                <p>
-                  Padding value:{" "}
-                  <span className="font-semibold text-white">
-                    {tableCellPaddingX}px x {tableCellPaddingY}px
-                  </span>
-                </p>
-              </div>
-            ) : (
-              <p className="text-sm text-amber-300">
-                Isi tanggal mulai valid dulu supaya target timeline bisa dihitung otomatis.
-              </p>
-            )}
-          </div>
-        </AppModal>
-
-        <AppModal
-          open={isRawInputOpen}
-          onOpenChange={setIsRawInputOpen}
-          title="Input Mentah"
-          description="Edit raw input penuh di sini, lalu render ulang untuk melihat hasil table terbaru."
-          dialogClassName="h-[92vh] max-w-[calc(100%-2rem)] sm:max-w-6xl"
-          contentClassName="flex-1"
-          footer={
-            <>
-              <Button variant="outline" onClick={() => setIsRawInputOpen(false)}>
-                Tutup
-              </Button>
-              <Button variant="outline" onClick={() => setIsParserDialogOpen(true)}>
-                Aturan parser
-              </Button>
-              <Button onClick={handleSubmitRawInput}>Render table</Button>
-            </>
-          }
-        >
-          <Textarea
-            value={rawInput}
-            onChange={(event) => setRawInput(event.target.value)}
-            className="min-h-full border-white/10 bg-slate-900 font-mono text-sm text-white"
-            placeholder="migrasiFunctionA;m | fileA,fileB,fileC,fileD | on progress | deskripsi"
-          />
-        </AppModal>
-
-        <AppModal
           open={Boolean(editingHeader)}
           onOpenChange={(open) => !open && setEditingHeader(null)}
           title="Edit Header Kolom"
@@ -2100,80 +2863,6 @@ export default function TimelinePlanner() {
           />
         </AppModal>
 
-        <AppModal
-          open={isParserDialogOpen}
-          onOpenChange={setIsParserDialogOpen}
-          title="Aturan Parser"
-          description="Referensi cepat untuk format raw input dan interaksi timeline."
-        >
-          <div className="grid gap-3 text-sm text-slate-300">
-            <div>baris pertama = nama kolom / header table</div>
-            <div>`|` = pindah ke kolom berikutnya</div>
-            <div>`,` = item banyak di dalam satu grup</div>
-          <div>`;m` = kolom sebelumnya di-merge vertikal mengikuti jumlah item dalam grup yang sama</div>
-          <div>`;ma` = merge auto ke bawah sampai ketemu value berikutnya di kolom yang sama</div>
-          <div>`;ma` juga bantu auto-koreksi baris pendek saat render, jadi kolom kosong akan disisipkan otomatis</div>
-            <div>`;status=NamaKolom` = status akan ditempel ke kolom header yang dipilih</div>
-            <div>`;timeline` di header = tandai kolom acuan timeline, contoh `Task;timeline`</div>
-            <div>`;start=Angka` = posisi mulai timeline hasil klik otomatis akan disimpan ke raw input</div>
-            <div>`;manual=2,5,9` = tambahan slot harian manual hasil `Shift+Click`</div>
-            <div>Export JSON = simpan seluruh setting dan raw input yang sudah disesuaikan</div>
-            <div>Import JSON = overwrite state aktif sesuai isi snapshot JSON</div>
-            <div className="text-slate-400">
-              Contoh:
-              `Task;timeline | Files | Status | Deskripsi`
-            </div>
-            <div className="text-slate-400">
-              `migrasiFunctionA;m;status=Task;start=1;manual=4 | fileA,fileB,fileC,fileD | on progress | deskripsi`
-            </div>
-            <div className="text-slate-400">
-              `Feature A;ma | controller-a | planned | desc`
-            </div>
-            <div className="text-slate-400">klik biasa = tidak mengubah timeline</div>
-            <div className="text-slate-400">`Ctrl+Click` = geser task, `Shift+Click` = tambah/hapus hari manual</div>
-            <div className="text-slate-400">tahan `Shift` lalu drag = isi beberapa slot manual sekaligus</div>
-          </div>
-        </AppModal>
-
-        <AppModal
-          open={isImportDialogOpen}
-          onOpenChange={setIsImportDialogOpen}
-          title="Import Snapshot JSON"
-          description="Paste JSON snapshot di bawah ini. Import akan meng-overwrite semua data aktif."
-          footer={
-            <>
-              <Button variant="outline" onClick={() => setIsImportDialogOpen(false)}>
-                Batal
-              </Button>
-              <Button className="bg-sky-500 text-white hover:bg-sky-400" onClick={handleImportJson}>
-                Import dan Override
-              </Button>
-            </>
-          }
-          contentClassName="max-h-[55vh]"
-        >
-          <div className="grid gap-4">
-            <div className="grid gap-2">
-              <label className="text-sm text-slate-300">Pilih file JSON</label>
-              <Input
-                type="file"
-                accept=".json,application/json"
-                onChange={handleImportFileChange}
-                className="border-white/10 bg-slate-900 text-white file:mr-3 file:rounded-md file:border-0 file:bg-sky-500 file:px-3 file:py-1 file:text-white"
-              />
-            </div>
-            <div className="grid gap-2">
-              <label className="text-sm text-slate-300">Konten JSON</label>
-              <Textarea
-                value={importDraft}
-                onChange={(event) => setImportDraft(event.target.value)}
-                className="min-h-56 border-white/10 bg-slate-900 font-mono text-sm text-white"
-                placeholder='{"version":1,"timelineStartParts":{"day":"12","month":"03","year":"2026"}}'
-              />
-            </div>
-            {importError ? <div className="text-sm text-rose-300">{importError}</div> : null}
-          </div>
-        </AppModal>
         </div>
     </main>
   );
